@@ -1,0 +1,24 @@
+[package]
+name = "mgba-siolink"
+version = "0.1.0"
+edition = "2021"
+license = "MPL-2.0"
+description = "Generic rollback netplay over emulated GBA SIO — drives 2-4 mgba cores as one link through the lockstep driver"
+repository = "https://github.com/tangobattle/mgba-siolink"
+
+[dependencies]
+crc32fast = "1"
+getgud = { git = "https://github.com/tangobattle/getgud" }
+# Needs the SIO driver state carried in the savestate blob (SIOCNT/RCNT
+# shadows + SIOMLT_SEND), on mgba-rs main since b3ad9c8.
+mgba = { git = "https://github.com/tangobattle/mgba-rs" }
+# Raw C access for Link::load's overdue-completeEvent repair (see
+# lib.rs); same git source as `mgba` itself so cargo unifies them and
+# the pointer types line up.
+mgba-sys = { git = "https://github.com/tangobattle/mgba-rs" }
+thiserror = "1"
+
+[lints.clippy]
+# The throttler is a verbatim copy from the tango workspace, which allows
+# this crate-wide; keep the copy byte-identical rather than "fixing" it.
+new_without_default = "allow"
