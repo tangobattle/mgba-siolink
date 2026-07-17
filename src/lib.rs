@@ -34,11 +34,10 @@ pub mod throttler;
 /// real multi-cable chain.
 pub const MAX_PLAYERS: usize = 4;
 
-// GBA io block indices (register address >> 1), for the SIO shadow-register
-// repairs around raw core loads.
+// GBA io block indices (register address >> 1), for the boot-capture
+// cable neutralization.
 const REG_SIOCNT: usize = 0x128 >> 1;
 const REG_RCNT: usize = 0x134 >> 1;
-const REG_SIOMLT_SEND: usize = 0x12a >> 1;
 
 /// Which core a tick treats as the frame-boundary reference. Player 0 is
 /// also the lockstep clock owner (primary).
@@ -300,20 +299,16 @@ impl Link {
         })
     }
 
-    /// Serialize core `i` for [`Link::from_states`]: the (cycle-normalized)
-    /// core savestate plus SIOMLT_SEND, which `GBAIOSerialize` never stores.
-    /// Valid at any tick boundary. The capture is only as exact as mgba's
-    /// savestate encoding — the deliberately-lossy corners the rollback
-    /// [`Snapshot`] carries out-of-band (FIFO sample countdowns, mid-refill
-    /// DMA control, an in-flight SIO completion) reconstruct approximately,
-    /// which is fine here: every peer reconstructs from the same bytes, and
-    /// a cable plug-in has no prior trajectory to stay faithful to.
+    /// Serialize core `i` for [`Link::from_states`]: a plain core
+    /// savestate. Valid at any tick boundary. The capture is only as exact
+    /// as mgba's savestate encoding — the deliberately-lossy corners the
+    /// rollback [`Snapshot`] carries out-of-band (FIFO sample countdowns,
+    /// mid-refill DMA control) reconstruct approximately, which is fine
+    /// here: every peer reconstructs from the same bytes, and a cable
+    /// plug-in has no prior trajectory to stay faithful to.
     pub fn capture_boot_state(&mut self, i: usize) -> Result<Vec<u8>, mgba::Error> {
         let state = self.cores[i].as_mut().save_state()?;
-        let mut bytes = state.as_slice().to_vec();
-        let siomlt = unsafe { (*gba_ptr(&mut self.cores[i])).memory.io[REG_SIOMLT_SEND] };
-        bytes.extend_from_slice(&siomlt.to_le_bytes());
-        Ok(bytes)
+        Ok(state.as_slice().to_vec())
     }
 
     /// Core `i`'s current SRAM/flash/EEPROM image, or `None` if the game
@@ -497,23 +492,18 @@ impl Link {
 ///   would survive re-derivation forever.
 /// - Any pending transfer-completion event is descheduled: it belongs to a
 ///   transfer on the old cable.
-/// - SIOMLT_SEND is never serialized at all, so it rides as a 2-byte tail
-///   on the blob and is poked back here.
 fn load_boot_state(core: &mut mgba::core::Core, blob: &[u8]) -> Result<(), mgba::Error> {
-    let state_len = std::mem::size_of::<mgba::state::State>();
-    if blob.len() != state_len + 2 {
+    if blob.len() != std::mem::size_of::<mgba::state::State>() {
         return Err(mgba::Error::CallFailed("boot state has the wrong length"));
     }
-    let (state_bytes, siomlt) = blob.split_at(state_len);
     // Sound per State::from_slice's contract: exact size, and the bytes came
     // from capture_boot_state on a compatible core.
-    let state = unsafe { mgba::state::State::from_slice(state_bytes) };
+    let state = unsafe { mgba::state::State::from_slice(blob) };
     core.as_mut().load_state(&state)?;
     deschedule_sio_complete(core);
     unsafe {
         let gba = gba_ptr(core);
         let io = &mut (*gba).memory.io;
-        io[REG_SIOMLT_SEND] = u16::from_le_bytes(siomlt.try_into().unwrap());
         (*gba).sio.siocnt = io[REG_SIOCNT] & !0x30fc;
         (*gba).sio.rcnt = io[REG_RCNT];
         // Mode derivation per sio.c's _switchMode, over the neutralized
