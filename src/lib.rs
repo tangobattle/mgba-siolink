@@ -715,4 +715,79 @@ mod tests {
              clock instead of parking the caught-up player (mgba parking fix missing?)",
         );
     }
+
+    /// Reproduces the freeze found after the parking fix landed: a player
+    /// promoted to clock owner by a detach still holds a TRANSFER_START in
+    /// its queue. Only secondaries are ever sent that event, and the detach
+    /// that promoted the player also tore down the transfer it announced —
+    /// but the queue survives promotion. Draining it as player 0 executes
+    /// the finishCycle reschedule override; with the transfer window long
+    /// past, nextEvent goes non-positive, and player 0 has no parking
+    /// branch to catch it: `mASSERT_DEBUG(nextEvent > 0)` (lockstep.c)
+    /// aborts a debug build, and a release build flags a phantom transfer
+    /// busy. Manufactured through the driver blob exactly like the wedge
+    /// repro above: this is the promoted player's persisted state as a
+    /// rollback restore would replay it. Note the abort tripwire only arms
+    /// in debug builds (mASSERT_DEBUG compiles out in release).
+    #[test]
+    fn promoted_clock_owner_with_stale_transfer_start_does_not_die() {
+        mgba::log::install_default_logger();
+        let rom = testrom::build();
+        let mut link = Link::new(vec![rom.clone(), rom]).unwrap();
+        let keys = |t: u32| [(t * 0x11) & 0x3ff, (t * 0x17) & 0x3ff];
+        for t in 0..600u32 {
+            link.tick(&keys(t));
+        }
+        let mut snap = link.save().unwrap();
+
+        // GBASIOLockstepSerializedState field offsets, checked against the
+        // static_asserts in lockstep.c.
+        const OFF_FLAGS: usize = 0x04;
+        const OFF_DRIVER_NEXT_EVENT: usize = 0x10;
+        const OFF_EVENTS: usize = 0x40;
+        const OFF_EVENT_FINISH_CYCLE: usize = 0x20;
+        const OFF_COORD_CYCLE: usize = 0x1c0;
+        const FLAG_ASLEEP: u32 = 1 << 7;
+        const FLAG_EVENT_SCHEDULED: u32 = 1 << 9;
+        const NUM_EVENTS_SHIFT: u32 = 3;
+        const NUM_EVENTS_MASK: u32 = 0xf << NUM_EVENTS_SHIFT;
+        const SIO_EV_TRANSFER_START: i32 = 4;
+
+        let rd = |b: &[u8], off: usize| i32::from_le_bytes(b[off..off + 4].try_into().unwrap());
+        let wr =
+            |b: &mut [u8], off: usize, v: i32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+
+        // Player 0's own blob: awake, lockstep event due immediately, and
+        // the queue replaced by a single TRANSFER_START whose transfer
+        // window is long gone — the leftover a detach-promotion carries.
+        let cycle = rd(&snap.drivers[0], OFF_COORD_CYCLE);
+        let b = &mut snap.drivers[0];
+        let mut flags = rd(b, OFF_FLAGS) as u32;
+        flags &= !FLAG_ASLEEP;
+        flags |= FLAG_EVENT_SCHEDULED;
+        flags = (flags & !NUM_EVENTS_MASK) | (1 << NUM_EVENTS_SHIFT);
+        wr(b, OFF_FLAGS, flags as i32);
+        wr(b, OFF_DRIVER_NEXT_EVENT, 4);
+        wr(b, OFF_EVENTS, cycle - 10_000); // timestamp: already due
+        wr(b, OFF_EVENTS + 4, 0); // sender: the departed clock owner
+        wr(b, OFF_EVENTS + 8, SIO_EV_TRANSFER_START);
+        wr(b, OFF_EVENTS + OFF_EVENT_FINISH_CYCLE, cycle - 100_000); // finished long ago
+
+        link.load(&snap).unwrap();
+
+        // An unguarded debug driver aborts on the reschedule assert; run
+        // on a watchdog'd thread so a residual wedge is also a reported
+        // failure rather than a hung test run.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for t in 600..840u32 {
+                link.tick(&keys(t));
+            }
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(20)).expect(
+            "link wedged or died: player 0 drained a stale TRANSFER_START \
+             (mgba stale-transfer guard missing?)",
+        );
+    }
 }
