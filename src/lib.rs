@@ -44,11 +44,15 @@ const REG_SIOMLT_SEND: usize = 0x12a >> 1;
 /// also the lockstep clock owner (primary).
 const REFERENCE: usize = 0;
 
-/// Upper bound on run_loop slices per tick, to turn a lockstep deadlock
-/// (which would otherwise spin forever) into a loud failure. A frame is
-/// ~70 lockstep intervals per core; 2M slices is orders of magnitude past
-/// any legitimate tick.
-const MAX_SLICES_PER_TICK: usize = 2_000_000;
+/// Upper bound on run_loop slices per tick, turning a lockstep livelock
+/// (which would otherwise spin forever) into a [`Link::try_tick`] error.
+/// Measured peaks on a maximally chatty link (MULTI exchange every frame,
+/// boot included — see the slice_budget test): ~1.6K slices for 2 players,
+/// ~3.2K for 4. 100K keeps ~30x headroom over that, while a *grinding*
+/// corrupt state errors out in well under a second instead of pegging a
+/// core for minutes below the cap (the old 2M cap read as a silent
+/// freeze: near-no-op slices ground for ages and the panic rarely fired).
+pub const MAX_SLICES_PER_TICK: usize = 100_000;
 
 pub struct Link {
     // Declaration order is drop order, and it matters: a core's deinit
@@ -390,8 +394,21 @@ impl Link {
     /// schedule (and therefore the whole link) deterministic and
     /// replayable.
     ///
-    /// Returns the number of slices run (diagnostic only).
+    /// Returns the number of slices run (diagnostic only). Panics on a
+    /// corrupt lockstep state; drivers that must survive one (netplay,
+    /// where a bad restore is survivable by unplugging the cable) use
+    /// [`try_tick`](Link::try_tick) instead.
     pub fn tick(&mut self, keys: &[u32]) -> usize {
+        self.try_tick(keys).unwrap()
+    }
+
+    /// [`tick`](Link::tick), but a corrupt lockstep state — every core
+    /// asleep, or [`MAX_SLICES_PER_TICK`] exceeded without finishing a
+    /// reference frame — comes back as an error instead of a panic. A
+    /// grind *below* any panic threshold reads as a frozen emulator with
+    /// a clean console; the cap is set low enough that the error fires
+    /// while the tick is still fast enough to deliver it.
+    pub fn try_tick(&mut self, keys: &[u32]) -> Result<usize, mgba::Error> {
         assert_eq!(keys.len(), self.cores.len(), "one key set per player");
         for (core, &k) in self.cores.iter_mut().zip(keys.iter()) {
             core.as_mut().set_keys(k);
@@ -415,16 +432,17 @@ impl Link {
             if !progressed {
                 // _verifyAwake on the C side guarantees not everyone sleeps;
                 // reaching this means the link state is corrupt.
-                panic!("sio lockstep link deadlocked: all cores asleep");
+                return Err(mgba::Error::CallFailed(
+                    "Link::tick (lockstep deadlock: all cores asleep)",
+                ));
             }
             if slices > MAX_SLICES_PER_TICK {
-                panic!(
-                    "sio lockstep link livelocked: {} slices without finishing a reference frame",
-                    slices
-                );
+                return Err(mgba::Error::CallFailed(
+                    "Link::tick (lockstep livelock: slice cap exceeded)",
+                ));
             }
         }
-        slices
+        Ok(slices)
     }
 
     /// Snapshot the full link. Valid at any tick boundary, including with a
@@ -770,5 +788,90 @@ fn restore_dmas(core: &mut mgba::core::Core, lanes: &[DmaLane; 4]) {
             (*dma).sourceOffset = lane.source_offset;
             (*dma).destOffset = lane.dest_offset;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Reproduces the netplay hard-freeze: a secondary player whose local
+    /// clock has caught the coordinator's shared cycle while its queue
+    /// head is still in the future. mgba's `_lockstepEvent` then computes
+    /// a non-positive reschedule; without the parking fix in the mgba
+    /// fork it refires forever at the same timestamp — with every core on
+    /// one thread, nothing can ever advance the shared clock, so a single
+    /// `Link::tick` never returns. The state is manufactured through the
+    /// driver-blob serialization (layout: GBASIOLockstepSerializedState
+    /// in mgba's gba/sio/lockstep.c), which is exactly how a rollback
+    /// restore would replay it.
+    #[test]
+    fn caught_up_secondary_with_future_event_does_not_wedge() {
+        mgba::log::install_default_logger();
+        let rom = testrom::build();
+        let mut link = Link::new(vec![rom.clone(), rom]).unwrap();
+        let keys = |t: u32| [(t * 0x11) & 0x3ff, (t * 0x17) & 0x3ff];
+        for t in 0..600u32 {
+            link.tick(&keys(t));
+        }
+        let mut snap = link.save().unwrap();
+
+        // GBASIOLockstepSerializedState field offsets, checked against the
+        // static_asserts in lockstep.c.
+        const OFF_FLAGS: usize = 0x04;
+        const OFF_DRIVER_NEXT_EVENT: usize = 0x10;
+        const OFF_EVENTS: usize = 0x40;
+        const EVENT_SIZE: usize = 0x30;
+        const OFF_COORD_CYCLE: usize = 0x1c0;
+        const FLAG_ASLEEP: u32 = 1 << 7;
+        const FLAG_EVENT_SCHEDULED: u32 = 1 << 9;
+        const NUM_EVENTS_SHIFT: u32 = 3;
+        const NUM_EVENTS_MASK: u32 = 0xf << NUM_EVENTS_SHIFT;
+        const SIO_EV_HARD_SYNC: i32 = 2;
+
+        let rd = |b: &[u8], off: usize| i32::from_le_bytes(b[off..off + 4].try_into().unwrap());
+        let wr =
+            |b: &mut [u8], off: usize, v: i32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+
+        // The shared clock rides player 0's blob: pull it well behind
+        // player 1's local time, and push player 0's next lockstep firing
+        // out so player 1 fires first.
+        let cycle = rd(&snap.drivers[0], OFF_COORD_CYCLE);
+        wr(&mut snap.drivers[0], OFF_COORD_CYCLE, cycle - 100_000);
+        wr(&mut snap.drivers[0], OFF_DRIVER_NEXT_EVENT, 100_000);
+
+        // Player 1: awake, lockstep event due immediately, and a queued
+        // event stamped far in the future (as the clock owner routinely
+        // produces when it enqueues mid-interval).
+        let b = &mut snap.drivers[1];
+        let mut flags = rd(b, OFF_FLAGS) as u32;
+        flags &= !FLAG_ASLEEP;
+        flags |= FLAG_EVENT_SCHEDULED;
+        let n = ((flags & NUM_EVENTS_MASK) >> NUM_EVENTS_SHIFT) as usize;
+        assert!(n < 8, "lockstep queue unexpectedly full");
+        flags = (flags & !NUM_EVENTS_MASK) | ((n as u32 + 1) << NUM_EVENTS_SHIFT);
+        wr(b, OFF_FLAGS, flags as i32);
+        wr(b, OFF_DRIVER_NEXT_EVENT, 4);
+        let ev = OFF_EVENTS + n * EVENT_SIZE;
+        wr(b, ev, cycle + 1_000_000); // timestamp: far future
+        wr(b, ev + 4, 0); // sender: player 0
+        wr(b, ev + 8, SIO_EV_HARD_SYNC);
+
+        link.load(&snap).unwrap();
+
+        // An unfixed driver never returns from the first tick, so run on
+        // a watchdog'd thread: the wedge becomes a reported failure, not
+        // a hung test run.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for t in 600..840u32 {
+                link.tick(&keys(t));
+            }
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(20)).expect(
+            "link wedged or died: the lockstep driver busy-waited on the shared \
+             clock instead of parking the caught-up player (mgba parking fix missing?)",
+        );
     }
 }

@@ -56,6 +56,12 @@ pub struct Report {
     /// The tick whose state this frame presents
     /// (`frontier - present_delay`, clamped to what has been simulated).
     pub presented: u32,
+    /// Peak run_loop slices a single simulated tick took inside this
+    /// advance (settle re-sims and speculation included; 0 when nothing
+    /// was simulated). Normal ticks are a few hundred slices; a sustained
+    /// climb toward [`crate::MAX_SLICES_PER_TICK`] is the signature of a
+    /// corrupted lockstep state grinding below the livelock cap.
+    pub slices_peak: u32,
 }
 
 /// Observes the simulation as it advances, from inside the engine's
@@ -93,6 +99,10 @@ struct Shared {
     confirmed: Vec<Box<[u32]>>,
     /// Host-installed per-tick observer, if any.
     observer: Option<Box<dyn TickObserver>>,
+    /// Peak run_loop slices any single [`Link::tick`] took since
+    /// [`Session::advance`] last reset it — the livelock early-warning
+    /// ([`Report::slices_peak`]).
+    slices_peak: usize,
 }
 
 /// A cloneable, cross-thread handle to the live link — the readout seam
@@ -152,7 +162,8 @@ impl getgud::World for LinkWorld {
         let keys = self.key_row(*local, remotes);
         let mut guard = self.shared.lock().unwrap();
         let shared = &mut *guard;
-        shared.link.tick(&keys[..self.num_players]);
+        let slices = shared.link.try_tick(&keys[..self.num_players])?;
+        shared.slices_peak = shared.slices_peak.max(slices);
         shared.live_tick += 1;
         if let Some(observer) = shared.observer.as_mut() {
             observer.on_tick(&mut shared.link, shared.live_tick);
@@ -245,6 +256,7 @@ impl Session {
             live_tick: 0,
             confirmed: Vec::new(),
             observer: None,
+            slices_peak: 0,
         }));
         Ok(Session {
             inner: getgud::Session::new(getgud::SessionParams {
@@ -376,6 +388,7 @@ impl Session {
             tick_advantage: self.inner.local_tick_advantage(),
         };
 
+        self.shared.lock().unwrap().slices_peak = 0;
         let presented = self.inner.advance(local_keys)?.tick;
 
         // Harvest the settled boundary this advance ended on, so a peer's
@@ -397,6 +410,7 @@ impl Session {
                 frontier,
                 confirmed: frontier - self.inner.local_queue_length() as u32,
                 presented,
+                slices_peak: self.shared.lock().unwrap().slices_peak.min(u32::MAX as usize) as u32,
             },
         ))
     }
