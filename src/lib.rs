@@ -72,12 +72,6 @@ pub struct Link {
 pub struct Snapshot {
     cores: Vec<Box<mgba::state::State>>,
     drivers: Vec<Vec<u8>>,
-    /// Each core's SIO transfer-completion event (`GBASIO::completeEvent`):
-    /// `Some(cycles until it fires)` when scheduled — negative when it has
-    /// come due but not yet been processed — or `None` when idle. Captured
-    /// from the timing list itself because the core savestate's own record
-    /// of this event is lossy; see [`sio_complete_state`].
-    sio_complete: Vec<Option<i32>>,
     /// Each core's direct-sound FIFO channels (A, B), captured verbatim
     /// because the core savestate's encoding is lossy; see
     /// [`audio_fifo_state`].
@@ -143,8 +137,6 @@ impl Snapshot {
             if let Some(blob) = self.drivers.get(i) {
                 h.update(blob);
             }
-            h.update(&[self.sio_complete[i].is_some() as u8]);
-            h.update(&self.sio_complete[i].unwrap_or(0).to_le_bytes());
             for lane in &self.audio_fifos[i] {
                 for w in &lane.fifo {
                     h.update(&w.to_le_bytes());
@@ -317,8 +309,7 @@ impl Link {
     /// which is fine here: every peer reconstructs from the same bytes, and
     /// a cable plug-in has no prior trajectory to stay faithful to.
     pub fn capture_boot_state(&mut self, i: usize) -> Result<Vec<u8>, mgba::Error> {
-        let mut state = self.cores[i].as_mut().save_state()?;
-        normalize_cpu_cycles(&mut state);
+        let state = self.cores[i].as_mut().save_state()?;
         let mut bytes = state.as_slice().to_vec();
         let siomlt = unsafe { (*gba_ptr(&mut self.cores[i])).memory.io[REG_SIOMLT_SEND] };
         bytes.extend_from_slice(&siomlt.to_le_bytes());
@@ -448,31 +439,24 @@ impl Link {
     /// Snapshot the full link. Valid at any tick boundary, including with a
     /// transfer in flight or any core parked by the lockstep protocol.
     pub fn save(&mut self) -> Result<Snapshot, mgba::Error> {
-        let mut cores = self
+        let cores = self
             .cores
             .iter_mut()
             .map(|core| core.as_mut().save_state())
             .collect::<Result<Vec<_>, _>>()?;
-        for state in &mut cores {
-            normalize_cpu_cycles(state);
-        }
         Ok(Snapshot {
             cores,
             drivers: self.drivers.iter_mut().map(|d| d.save_state()).collect(),
-            sio_complete: self.cores.iter_mut().map(sio_complete_state).collect(),
             audio_fifos: self.cores.iter_mut().map(audio_fifo_state).collect(),
             dmas: self.cores.iter_mut().map(dma_state).collect(),
         })
     }
 
     /// Restore a snapshot taken from THIS link (same attach configuration).
-    /// Core states load first — a core load rebuilds its timing list, which
-    /// the driver blob then re-schedules the lockstep event into. In
-    /// between, each core's SIO completion event is forced back to the
-    /// recorded truth (the core load's own restore of it is lossy; see
-    /// [`sio_complete_state`]) so an exact tie with the lockstep event
-    /// keeps the completion first in the timing list, matching both the
-    /// vanilla restore order and the live scheduling order.
+    /// Core states load first — a core load rebuilds its timing list, the
+    /// SIO completion event included — and the driver blobs then
+    /// re-schedule each lockstep event into it, so an exact-timestamp tie
+    /// keeps the completion first, matching the live scheduling order.
     pub fn load(&mut self, snapshot: &Snapshot) -> Result<(), mgba::Error> {
         assert_eq!(
             snapshot.cores.len(),
@@ -480,9 +464,7 @@ impl Link {
             "snapshot is from a link with a different player count"
         );
         for (i, (core, state)) in self.cores.iter_mut().zip(snapshot.cores.iter()).enumerate() {
-            defuse_sio_mode_switch(core, state);
             core.as_mut().load_state(state)?;
-            restore_sio_complete(core, snapshot.sio_complete[i]);
             restore_audio_fifos(core, &snapshot.audio_fifos[i]);
             restore_dmas(core, &snapshot.dmas[i]);
         }
@@ -493,84 +475,6 @@ impl Link {
         }
         Ok(())
     }
-}
-
-/// Pre-set `GBASIO::mode` to the mode the incoming state derives, so the
-/// core load's own SIO touch-up cannot fire the lockstep driver mid-load.
-///
-/// `GBAIODeserialize` ends with `GBASIOWriteRCNT(&gba->sio, io[RCNT])`,
-/// whose `_switchMode` compares the LOADED registers' mode against the
-/// PRE-LOAD `sio->mode` and, when they differ (i.e. the rollback window
-/// spans a link-mode switch — routine for bn1, which hops between NORMAL
-/// and MULTI), calls the lockstep driver's `setMode` while the link is
-/// half-restored: the core's clock has been rewound but the coordinator's
-/// has not. For player 0 that path runs
-/// `GBASIOLockstepCoordinatorWaitOnPlayers` → `_advanceCycle`, whose
-/// `newCycle - coordinator->cycle >= 0` assert fires (the crash at
-/// lockstep.c:700); it also force-sleeps the player and zeroes
-/// `cpu->nextEvent` AFTER the state restored it. For the other players it
-/// enqueues a phantom `SIO_EV_MODE_SET` into the other players' queues.
-/// All of it is spurious — the driver blobs loaded right after this carry
-/// the true mode/queue/coordinator state — so make `_switchMode` see "no
-/// change" and do nothing.
-fn defuse_sio_mode_switch(core: &mut mgba::core::Core, state: &mgba::state::State) {
-    const OFF_IO_SIOCNT: usize = 0x400 + 0x128;
-    const OFF_IO_RCNT: usize = 0x400 + 0x134;
-    let st = state.as_slice();
-    let io16 = |off: usize| u16::from_le_bytes(st[off..off + 2].try_into().unwrap());
-    // Mode derivation per sio.c's _switchMode.
-    let mode = ((io16(OFF_IO_RCNT) & 0xc000) | (io16(OFF_IO_SIOCNT) & 0x3000)) >> 12;
-    let mode = if mode < 8 { mode & 0x3 } else { mode & 0xc };
-    unsafe {
-        (*gba_ptr(core)).sio.mode = mode as mgba_sys::GBASIOMode;
-    }
-}
-
-/// Rebase a serialized core state so `cpu.cycles` is non-negative.
-///
-/// A core parked by the lockstep protocol mid-event-batch can end its slice
-/// with `cpu->cycles == cpu->nextEvent < 0` (`GBAProcessEvents` copies the
-/// overdue next-event offset into `cycles` while the CPU is DMA-blocked),
-/// which is a perfectly healthy live state — but `GBADeserialize` rejects
-/// any negative `cpu.cycles` as a corrupted savestate, so the snapshot
-/// would refuse to load (and in a netplay session that half-applies the
-/// link restore: some cores loaded, the rest left at the pre-load tick —
-/// the lockstep clocks then disagree and the coordinator's
-/// `_advanceCycle` assert fires).
-///
-/// Only the SUM `masterCycles + cycles` (the current time) and the DISTANCE
-/// `nextEvent - cycles` are meaningful — every serialized event offset is
-/// relative to the sum, and the run loop only compares `cycles` against
-/// `nextEvent`. Folding `cycles` into `masterCycles` (and `globalCycles`,
-/// its debugger twin) is therefore behaviorally exact: the restored core
-/// executes the same instructions and processes the same events at the
-/// same absolute times as the live one.
-fn normalize_cpu_cycles(state: &mut mgba::state::State) {
-    // GBASerializedState offsets (gba/serialize.h): masterCycles, cpu.cycles,
-    // cpu.nextEvent, globalCycles.
-    const OFF_MASTER_CYCLES: usize = 0x00c;
-    const OFF_CPU_CYCLES: usize = 0x068;
-    const OFF_CPU_NEXT_EVENT: usize = 0x06c;
-    const OFF_GLOBAL_CYCLES: usize = 0x310;
-    let bytes = unsafe {
-        std::slice::from_raw_parts_mut(
-            state as *mut mgba::state::State as *mut u8,
-            std::mem::size_of::<mgba::state::State>(),
-        )
-    };
-    let read_i32 = |b: &[u8], off: usize| i32::from_le_bytes(b[off..off + 4].try_into().unwrap());
-    let cycles = read_i32(bytes, OFF_CPU_CYCLES);
-    if cycles >= 0 {
-        return;
-    }
-    let master = read_i32(bytes, OFF_MASTER_CYCLES).wrapping_add(cycles);
-    let next_event = read_i32(bytes, OFF_CPU_NEXT_EVENT).wrapping_sub(cycles);
-    let global = i64::from_le_bytes(bytes[OFF_GLOBAL_CYCLES..OFF_GLOBAL_CYCLES + 8].try_into().unwrap())
-        .wrapping_add(cycles as i64);
-    bytes[OFF_MASTER_CYCLES..OFF_MASTER_CYCLES + 4].copy_from_slice(&master.to_le_bytes());
-    bytes[OFF_CPU_CYCLES..OFF_CPU_CYCLES + 4].copy_from_slice(&0i32.to_le_bytes());
-    bytes[OFF_CPU_NEXT_EVENT..OFF_CPU_NEXT_EVENT + 4].copy_from_slice(&next_event.to_le_bytes());
-    bytes[OFF_GLOBAL_CYCLES..OFF_GLOBAL_CYCLES + 8].copy_from_slice(&global.to_le_bytes());
 }
 
 /// Load a serialized boot state (from [`Link::capture_boot_state`]) into a
@@ -605,7 +509,7 @@ fn load_boot_state(core: &mut mgba::core::Core, blob: &[u8]) -> Result<(), mgba:
     // from capture_boot_state on a compatible core.
     let state = unsafe { mgba::state::State::from_slice(state_bytes) };
     core.as_mut().load_state(&state)?;
-    restore_sio_complete(core, None);
+    deschedule_sio_complete(core);
     unsafe {
         let gba = gba_ptr(core);
         let io = &mut (*gba).memory.io;
@@ -622,76 +526,25 @@ fn load_boot_state(core: &mut mgba::core::Core, blob: &[u8]) -> Result<(), mgba:
     Ok(())
 }
 
-/// Raw C-side view of a core's GBA, for the completion-event surgery below.
-/// The binding crate exposes no timing-event API and must not be modified
-/// (nor may mgba's C side); `GBAMutRef` is `#[repr(transparent)]` over
-/// `*mut mgba_sys::GBA`, which makes the transmute layout-sound, and the
-/// `mgba-sys` dependency comes from the same git source as `mgba` itself so
-/// the types are the same crate's.
+/// Raw C-side view of a core's GBA, for the state surgery in this module.
+/// `GBAMutRef` is `#[repr(transparent)]` over `*mut mgba_sys::GBA`, which
+/// makes the transmute layout-sound, and the `mgba-sys` dependency comes
+/// from the same git source as `mgba` itself so the types are the same
+/// crate's.
 fn gba_ptr(core: &mut mgba::core::Core) -> *mut mgba_sys::GBA {
     unsafe { std::mem::transmute(core.as_mut().gba_mut()) }
 }
 
-/// Capture the true scheduling of a core's SIO transfer-completion event
-/// (`GBASIO::completeEvent`): `Some(cycles until fire)` or `None`.
-///
-/// This must ride in the link snapshot because the core savestate is lossy
-/// here. mgba serializes the event as `hw.sioNextEvent = when - now` with
-/// no "scheduled" bit and restores it in `GBAHardwareDeserialize`
-/// (gba/cart/gpio.c) behind the legacy heuristic
-/// `(SIOCNT & 0x0080) && (uint32_t)stored < 0x20000`, which is wrong in
-/// both directions under the cooperative lockstep interleave:
-///
-/// - A completion that has come due but not yet run — relative `when`
-///   slightly NEGATIVE — is dropped: `GBASIOLockstepPlayerSleep` force-
-///   exits a run slice mid-event-batch (`cpu->nextEvent = 0` +
-///   `GBAInterrupt`), so tick boundaries regularly park a core with the
-///   completion pending-overdue. Stored negative, it reads back as a huge
-///   unsigned value and the restored machine never finishes the in-flight
-///   transfer: the re-simulation forks from the original run on the very
-///   next slice. bn1/bn2/bn3 keep MULTI/NORMAL transfers in flight across
-///   nearly every tick boundary, which is why they trip this constantly
-///   while bn4-6 idle through most boundaries.
-/// - Conversely a stale `hw.sioNextEvent` that happens to land in
-///   `[0, 0x20000)` while the busy/start bit is set (a secondary can hold
-///   START without the driver ever scheduling a completion) would be
-///   restored SPURIOUSLY, conjuring a finish the live machine never had.
-///
-/// Recording the truth at save and forcing it at load sidesteps the
-/// heuristic entirely.
-fn sio_complete_state(core: &mut mgba::core::Core) -> Option<i32> {
+/// Deschedule a core's SIO transfer-completion event
+/// (`GBASIO::completeEvent`). The core savestate restores the completion
+/// exactly, but a boot capture is loaded onto a NEW cable: a pending
+/// completion belongs to a transfer on the old one and must not fire here.
+fn deschedule_sio_complete(core: &mut mgba::core::Core) {
     unsafe {
         let gba = gba_ptr(core);
         let timing = std::ptr::addr_of_mut!((*gba).timing);
         let event = std::ptr::addr_of_mut!((*gba).sio.completeEvent);
-        if mgba_sys::mTimingIsScheduled(timing, event) {
-            Some(mgba_sys::mTimingUntil(timing, event))
-        } else {
-            None
-        }
-    }
-}
-
-/// Force a core's SIO completion event to the recorded scheduling, exactly
-/// reproducing the live machine: an overdue completion fires first thing
-/// next slice with the same `cyclesLate` the live run saw (or stays frozen
-/// until the lockstep protocol wakes a parked core), and a spurious restore
-/// is removed. Call after the owning core's `load_state` (which rebuilt the
-/// timing list) and before the driver blob load, so an exact-timestamp tie
-/// with the lockstep event resolves the same way the C restore path orders
-/// them (completion first — also the live order, since the lockstep event
-/// re-schedules itself at the end of every `_lockstepEvent` firing).
-fn restore_sio_complete(core: &mut mgba::core::Core, scheduled: Option<i32>) {
-    unsafe {
-        let gba = gba_ptr(core);
-        let timing = std::ptr::addr_of_mut!((*gba).timing);
-        let event = std::ptr::addr_of_mut!((*gba).sio.completeEvent);
-        // Descheduling an unscheduled event is a harmless no-op; scheduling
-        // a scheduled one corrupts the list, so always deschedule first.
         mgba_sys::mTimingDeschedule(timing, event);
-        if let Some(when) = scheduled {
-            mgba_sys::mTimingSchedule(timing, event, when);
-        }
     }
 }
 
