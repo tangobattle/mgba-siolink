@@ -57,7 +57,7 @@ pub struct Link {
     // Declaration order is drop order, and it matters: a core's deinit
     // calls back into its SIO driver, and detaching a driver touches the
     // coordinator.
-    cores: Vec<mgba::core::Core>,
+    cores: Vec<mgba::core::OwnedCore>,
     drivers: Vec<mgba::sio::Driver>,
     #[allow(dead_code)]
     coordinator: mgba::sio::Coordinator,
@@ -206,7 +206,7 @@ impl Link {
         let core_options = mgba::core::Options::default();
 
         let mut cores = (0..num_players)
-            .map(|_| mgba::core::Core::new_gba("mgba-siolink", &core_options))
+            .map(|_| mgba::core::OwnedCore::new_gba("mgba-siolink", &core_options))
             .collect::<Result<Vec<_>, _>>()?;
         let mut drivers = if num_players > 1 {
             (0..num_players)
@@ -218,17 +218,17 @@ impl Link {
 
         for (i, (core, side)) in cores.iter_mut().zip(options.sides).enumerate() {
             core.enable_video_buffer();
-            core.as_mut().load_rom(mgba::vfile::VFile::from_vec(side.rom))?;
+            core.load_rom(mgba::vfile::VFile::from_vec(side.rom))?;
             if let Some(save) = side.save {
-                core.as_mut().load_save(mgba::vfile::VFile::from_vec(save))?;
+                core.load_save(mgba::vfile::VFile::from_vec(save))?;
             }
             if let Some(rtc) = options.rtc {
                 core.set_rtc_fixed(rtc);
             }
             if let Some(driver) = drivers.get_mut(i) {
-                driver.install(&mut core.as_mut());
+                driver.install(core);
             }
-            core.as_mut().reset();
+            core.reset();
         }
 
         Ok(Link {
@@ -265,18 +265,18 @@ impl Link {
         let core_options = mgba::core::Options::default();
 
         let mut cores = (0..num_players)
-            .map(|_| mgba::core::Core::new_gba("mgba-siolink", &core_options))
+            .map(|_| mgba::core::OwnedCore::new_gba("mgba-siolink", &core_options))
             .collect::<Result<Vec<_>, _>>()?;
         for (core, side) in cores.iter_mut().zip(sides) {
             core.enable_video_buffer();
-            core.as_mut().load_rom(mgba::vfile::VFile::from_vec(side.rom))?;
+            core.load_rom(mgba::vfile::VFile::from_vec(side.rom))?;
             if let Some(save) = side.save {
-                core.as_mut().load_save(mgba::vfile::VFile::from_vec(save))?;
+                core.load_save(mgba::vfile::VFile::from_vec(save))?;
             }
             if let Some(rtc) = rtc {
                 core.set_rtc_fixed(rtc);
             }
-            core.as_mut().reset();
+            core.reset();
             load_boot_state(core, &side.state)?;
         }
 
@@ -289,7 +289,7 @@ impl Link {
             Vec::new()
         };
         for (core, driver) in cores.iter_mut().zip(drivers.iter_mut()) {
-            driver.install(&mut core.as_mut());
+            driver.install(core);
         }
 
         Ok(Link {
@@ -307,7 +307,7 @@ impl Link {
     /// here: every peer reconstructs from the same bytes, and a cable
     /// plug-in has no prior trajectory to stay faithful to.
     pub fn capture_boot_state(&mut self, i: usize) -> Result<Vec<u8>, mgba::Error> {
-        let state = self.cores[i].as_mut().save_state()?;
+        let state = self.cores[i].save_state()?;
         Ok(state.as_slice().to_vec())
     }
 
@@ -333,12 +333,12 @@ impl Link {
         self.cores.len()
     }
 
-    pub fn core(&self, i: usize) -> mgba::core::CoreRef<'_> {
-        self.cores[i].as_ref()
+    pub fn core(&self, i: usize) -> &mgba::core::Core {
+        &self.cores[i]
     }
 
-    pub fn core_mut(&mut self, i: usize) -> mgba::core::CoreMutRef<'_> {
-        self.cores[i].as_mut()
+    pub fn core_mut(&mut self, i: usize) -> &mut mgba::core::Core {
+        &mut self.cores[i]
     }
 
     pub fn player_id(&self, i: usize) -> i32 {
@@ -359,7 +359,7 @@ impl Link {
     /// core teardown into a jump through reclaimed memory. `Core`'s drop
     /// order (deinit, then fields) keeps the trapper alive exactly long
     /// enough.
-    pub fn set_traps(&mut self, i: usize, traps: Vec<(u32, Box<dyn Fn(mgba::core::CoreMutRef)>)>) {
+    pub fn set_traps(&mut self, i: usize, traps: Vec<(u32, Box<dyn Fn(&mut mgba::core::Core)>)>) {
         self.cores[i].set_traps(traps);
     }
 
@@ -370,7 +370,7 @@ impl Link {
     /// cores nobody is watching: the remote sides during live play, every
     /// side while re-simulating.
     pub fn set_frameskip(&mut self, i: usize, frameskip: i32) {
-        self.cores[i].as_mut().gba_mut().set_frameskip(frameskip);
+        self.cores[i].gba_mut().set_frameskip(frameskip);
     }
 
     /// Advance the link by one frame of the reference core, interleaving
@@ -397,21 +397,21 @@ impl Link {
     pub fn try_tick(&mut self, keys: &[u32]) -> Result<usize, mgba::Error> {
         assert_eq!(keys.len(), self.cores.len(), "one key set per player");
         for (core, &k) in self.cores.iter_mut().zip(keys.iter()) {
-            core.as_mut().set_keys(k);
+            core.set_keys(k);
         }
 
-        let target = self.cores[REFERENCE].as_ref().frame_counter().wrapping_add(1);
+        let target = self.cores[REFERENCE].frame_counter().wrapping_add(1);
         let mut slices = 0;
-        while self.cores[REFERENCE].as_ref().frame_counter() != target {
+        while self.cores[REFERENCE].frame_counter() != target {
             let mut progressed = false;
             for i in 0..self.cores.len() {
                 if self.drivers.get(i).is_some_and(|d| d.asleep()) {
                     continue;
                 }
-                if i == REFERENCE && self.cores[REFERENCE].as_ref().frame_counter() == target {
+                if i == REFERENCE && self.cores[REFERENCE].frame_counter() == target {
                     continue;
                 }
-                self.cores[i].as_mut().run_loop();
+                self.cores[i].run_loop();
                 progressed = true;
                 slices += 1;
             }
@@ -437,13 +437,13 @@ impl Link {
         let cores = self
             .cores
             .iter_mut()
-            .map(|core| core.as_mut().save_state())
+            .map(|core| core.save_state())
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Snapshot {
             cores,
             drivers: self.drivers.iter_mut().map(|d| d.save_state()).collect(),
-            audio_fifos: self.cores.iter_mut().map(audio_fifo_state).collect(),
-            dmas: self.cores.iter_mut().map(dma_state).collect(),
+            audio_fifos: self.cores.iter_mut().map(|core| audio_fifo_state(core)).collect(),
+            dmas: self.cores.iter_mut().map(|core| dma_state(core)).collect(),
         })
     }
 
@@ -459,7 +459,7 @@ impl Link {
             "snapshot is from a link with a different player count"
         );
         for (i, (core, state)) in self.cores.iter_mut().zip(snapshot.cores.iter()).enumerate() {
-            core.as_mut().load_state(state)?;
+            core.load_state(state)?;
             restore_audio_fifos(core, &snapshot.audio_fifos[i]);
             restore_dmas(core, &snapshot.dmas[i]);
         }
@@ -499,7 +499,7 @@ fn load_boot_state(core: &mut mgba::core::Core, blob: &[u8]) -> Result<(), mgba:
     // Sound per State::from_slice's contract: exact size, and the bytes came
     // from capture_boot_state on a compatible core.
     let state = unsafe { mgba::state::State::from_slice(blob) };
-    core.as_mut().load_state(&state)?;
+    core.load_state(&state)?;
     deschedule_sio_complete(core);
     unsafe {
         let gba = gba_ptr(core);
@@ -516,13 +516,11 @@ fn load_boot_state(core: &mut mgba::core::Core, blob: &[u8]) -> Result<(), mgba:
     Ok(())
 }
 
-/// Raw C-side view of a core's GBA, for the state surgery in this module.
-/// `GBAMutRef` is `#[repr(transparent)]` over `*mut mgba_sys::GBA`, which
-/// makes the transmute layout-sound, and the `mgba-sys` dependency comes
-/// from the same git source as `mgba` itself so the types are the same
-/// crate's.
+/// Raw C-side view of a core's GBA, for the state surgery in this module
+/// (the `mgba-sys` dependency comes from the same git source as `mgba`
+/// itself, so the types are the same crate's).
 fn gba_ptr(core: &mut mgba::core::Core) -> *mut mgba_sys::GBA {
-    unsafe { std::mem::transmute(core.as_mut().gba_mut()) }
+    core.gba_mut().as_raw()
 }
 
 /// Deschedule a core's SIO transfer-completion event
