@@ -762,3 +762,107 @@ fn abandoned_event_frames_recover() {
     // The host's payload survived all of it.
     assert_eq!(ok(&mut link, 1, 0x26, &[]), vec![1, 0x0000_0077]);
 }
+
+/// Reproduces the crossover-battle freeze: every airwaves clock is an
+/// int32 cycle counter, and mTimingCurrentTime crosses the sign
+/// boundary ~128 emulated seconds after boot. The coordinator compared
+/// those counters with sign-unsafe arithmetic (`a - b >= 0` is
+/// signed-overflow UB there, and compilers fold it to a direct
+/// `a >= b`), so at the boundary the clock owner's guard went
+/// permanently false: the shared clock froze, no RF tick ever committed
+/// again, and a client parked mid-wait slept forever while its host
+/// ground until the game's own link watchdog bailed (BN6 froze on chip
+/// select; Boktai 3 showed 通信エラー). Manufactured through the driver
+/// blobs exactly as a rollback restore would replay it: every clock —
+/// per-player cycle offsets, the shared cycle, any queued event
+/// timestamps — shifts so local time sits just below 2^31, and a
+/// send-and-wait exchange must then cross the boundary alive.
+#[test]
+fn airwaves_survive_the_cycle_counter_sign_wrap() {
+    let mut link = wireless_link(2);
+    login(&mut link, 0);
+    login(&mut link, 1);
+    host(&mut link, 0);
+    join(&mut link, 1, 0x61F0);
+
+    let mut snap = link.save().unwrap();
+
+    // GBASIOWirelessSerializedState field offsets, checked against the
+    // static_asserts in wireless.c.
+    const OFF_FLAGS: usize = 0x04;
+    const OFF_PLAYER_CYCLE_OFFSET: usize = 0x34;
+    const OFF_EVENTS: usize = 0x40;
+    const EVENT_SIZE: usize = 0x10;
+    const OFF_COORD_CYCLE: usize = 0x4A0;
+    const NUM_EVENTS_MASK: u32 = 0xF;
+
+    let rd = |b: &[u8], off: usize| i32::from_le_bytes(b[off..off + 4].try_into().unwrap());
+    let wr = |b: &mut [u8], off: usize, v: i32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+
+    // Land the shared clock a quarter-frame short of 2^31; the exchange
+    // below then crosses the boundary mid-flight. Shifting every
+    // cycleOffset down moves every player's local time up by the same
+    // amount, so nothing changes relative — only where the counters sit
+    // in int32 space.
+    let delta = 0x7FFF_0000u32.wrapping_sub(rd(snap.driver_blob(0), OFF_COORD_CYCLE) as u32) as i32;
+    for i in 0..2 {
+        let b = snap.driver_blob_mut(i);
+        let n = (rd(b, OFF_FLAGS) as u32 & NUM_EVENTS_MASK) as usize;
+        let off = rd(b, OFF_PLAYER_CYCLE_OFFSET).wrapping_sub(delta);
+        wr(b, OFF_PLAYER_CYCLE_OFFSET, off);
+        for e in 0..n {
+            let off = OFF_EVENTS + e * EVENT_SIZE;
+            let ts = rd(b, off).wrapping_add(delta);
+            wr(b, off, ts);
+        }
+    }
+    let b = snap.driver_blob_mut(0);
+    let cycle = rd(b, OFF_COORD_CYCLE).wrapping_add(delta);
+    wr(b, OFF_COORD_CYCLE, cycle);
+    link.load(&snap).unwrap();
+
+    // The freeze scenario: client parks on sendDataAndWait, host
+    // transmits, and the RF commit on the far side of the boundary must
+    // wake the client with its event frame.
+    ok(&mut link, 1, 0x25, &[2 << 8, 0x0000_BEEF]);
+    set_data32(&mut link, 1, IDLE);
+    write_siocnt(&mut link, 1, CNT_SLAVE);
+    write_siocnt(&mut link, 1, CNT_SLAVE_GO);
+
+    ok(&mut link, 0, 0x24, &[1, 0x0000_0042]);
+    for _ in 0..8 {
+        if siocnt(&mut link, 1) & 0x80 == 0 {
+            break;
+        }
+        tick(&mut link);
+    }
+    assert_eq!(
+        siocnt(&mut link, 1) & 0x80,
+        0,
+        "event frame never arrived: the airwaves froze at the int32 cycle boundary"
+    );
+    assert_eq!(data32(&mut link, 1), 0x9966_0028);
+    dance_slave(&mut link, 1);
+
+    // The exchange finishes on wrapped (negative) clocks.
+    set_data32(&mut link, 1, 0x9966_00A8);
+    write_siocnt(&mut link, 1, CNT_SLAVE_GO);
+    for _ in 0..4 {
+        if siocnt(&mut link, 1) & 0x80 == 0 {
+            break;
+        }
+        tick(&mut link);
+    }
+    assert_eq!(siocnt(&mut link, 1) & 0x80, 0, "ack transfer never completed");
+    dance_slave(&mut link, 1);
+    assert_eq!(ok(&mut link, 1, 0x26, &[]), vec![1, 0x0000_0042]);
+    assert_eq!(ok(&mut link, 0, 0x26, &[]), vec![2 << 8, 0x0000_BEEF]);
+
+    // And the shared clock really did cross: it now sits past 2^31,
+    // negative in int32 space.
+    let snap = link.save().unwrap();
+    assert!(
+        rd(snap.driver_blob(0), OFF_COORD_CYCLE) < 0,
+        "test did not actually cross the boundary"
+    );
+}

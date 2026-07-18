@@ -249,6 +249,14 @@ impl Snapshot {
         &self.drivers[i]
     }
 
+    /// Mutable view of a driver blob, for tests that manufacture
+    /// hard-to-reach lockstep states through the serialized form (the
+    /// same bytes a rollback restore replays); see the wedge repros in
+    /// this file's tests and the clock-wrap test in tests/wireless.rs.
+    pub fn driver_blob_mut(&mut self, i: usize) -> &mut Vec<u8> {
+        &mut self.drivers[i]
+    }
+
     /// Digest of the rollback-relevant state, comparable across peers
     /// simulating the same link (the desync canary). Deliberately built
     /// from discrete savestate fields rather than raw state bytes: mgba
@@ -971,6 +979,97 @@ mod tests {
         rx.recv_timeout(std::time::Duration::from_secs(20)).expect(
             "link wedged or died: player 0 drained a stale TRANSFER_START \
              (mgba stale-transfer guard missing?)",
+        );
+    }
+
+    /// The cable twin of the wireless clock-wrap test (see
+    /// tests/wireless.rs): every lockstep clock is an int32 cycle
+    /// counter that crosses the sign boundary ~128 emulated seconds
+    /// after boot, and the sign-unsafe comparisons in lockstep.c froze
+    /// the clock owner's guard there. A busy MULTI link limps across
+    /// (the transfer path advances the shared clock outside the broken
+    /// guard), but a QUIET link — two players idling outside a link
+    /// scene — parks its secondaries on the sync cadence, and only the
+    /// guard ever wakes them: at the boundary the secondary freezes for
+    /// the next 128 emulated seconds. Shift every clock so local time
+    /// sits just below 2^31 and idle across the boundary: the secondary
+    /// must keep making frames, and the shared clock must come out the
+    /// other side wrapped negative.
+    #[test]
+    fn cable_link_survives_the_cycle_counter_sign_wrap() {
+        mgba::log::install_default_logger();
+        let rom = testrom::build_idle();
+        let mut link = Link::new(vec![rom.clone(), rom]).unwrap();
+        let keys = |t: u32| [(t * 0x11) & 0x3ff, (t * 0x17) & 0x3ff];
+        for t in 0..600u32 {
+            link.tick(&keys(t));
+        }
+        let mut snap = link.save().unwrap();
+
+        // GBASIOLockstepSerializedState field offsets, checked against
+        // the static_asserts in lockstep.c.
+        const OFF_FLAGS: usize = 0x04;
+        const OFF_PLAYER_CYCLE_OFFSET: usize = 0x34;
+        const OFF_EVENTS: usize = 0x40;
+        const EVENT_SIZE: usize = 0x30;
+        const OFF_EVENT_FLAGS: usize = 0x08;
+        const OFF_EVENT_FINISH_CYCLE: usize = 0x20;
+        const OFF_COORD_CYCLE: usize = 0x1c0;
+        const NUM_EVENTS_SHIFT: u32 = 3;
+        const NUM_EVENTS_MASK: u32 = 0xf << NUM_EVENTS_SHIFT;
+        const EVENT_TYPE_MASK: u32 = 0x7;
+        const SIO_EV_TRANSFER_START: u32 = 4;
+
+        let rd = |b: &[u8], off: usize| i32::from_le_bytes(b[off..off + 4].try_into().unwrap());
+        let wr =
+            |b: &mut [u8], off: usize, v: i32| b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+
+        // Land the shared clock a quarter-frame short of 2^31. Shifting
+        // every cycleOffset down moves every local time up in lockstep;
+        // queued event timestamps (and TRANSFER_START finish cycles —
+        // the union holds a mode for MODE_SET, which must not shift)
+        // ride along.
+        let delta = 0x7FFF_0000u32.wrapping_sub(rd(&snap.drivers[0], OFF_COORD_CYCLE) as u32) as i32;
+        for b in snap.drivers.iter_mut() {
+            let n = ((rd(b, OFF_FLAGS) as u32 & NUM_EVENTS_MASK) >> NUM_EVENTS_SHIFT) as usize;
+            let off = rd(b, OFF_PLAYER_CYCLE_OFFSET).wrapping_sub(delta);
+            wr(b, OFF_PLAYER_CYCLE_OFFSET, off);
+            for e in 0..n {
+                let ev = OFF_EVENTS + e * EVENT_SIZE;
+                let ts = rd(b, ev).wrapping_add(delta);
+                wr(b, ev, ts);
+                if rd(b, ev + OFF_EVENT_FLAGS) as u32 & EVENT_TYPE_MASK == SIO_EV_TRANSFER_START {
+                    let finish = rd(b, ev + OFF_EVENT_FINISH_CYCLE).wrapping_add(delta);
+                    wr(b, ev + OFF_EVENT_FINISH_CYCLE, finish);
+                }
+            }
+        }
+        let b = &mut snap.drivers[0];
+        let cycle = rd(b, OFF_COORD_CYCLE).wrapping_add(delta);
+        wr(b, OFF_COORD_CYCLE, cycle);
+        link.load(&snap).unwrap();
+
+        // Cross the boundary with the link under load, watchdog'd so a
+        // wedge is a reported failure rather than a hung test run.
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let before = link.core(1).frame_counter();
+            for t in 600..840u32 {
+                link.tick(&keys(t));
+            }
+            let frames = link.core(1).frame_counter().wrapping_sub(before);
+            let _ = tx.send((link.save().unwrap(), frames));
+        });
+        let (snap, frames) = rx
+            .recv_timeout(std::time::Duration::from_secs(20))
+            .expect("link wedged or died crossing the int32 cycle boundary");
+        assert!(
+            rd(snap.driver_blob(0), OFF_COORD_CYCLE) < 0,
+            "shared clock stalled instead of wrapping"
+        );
+        assert!(
+            frames >= 200,
+            "secondary froze crossing the boundary: only {frames} frames"
         );
     }
 }
