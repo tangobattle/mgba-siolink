@@ -32,6 +32,7 @@ fn build_link(num_players: usize, rom: &[u8], save: Option<&[u8]>) -> Link {
             })
             .collect(),
         rtc: Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_752_000_000)),
+        peripheral: Default::default(),
     })
     .unwrap()
 }

@@ -9,13 +9,24 @@
 //! predicted remote keys into `tick`, and restores a `Snapshot` to
 //! re-simulate when a prediction turns out wrong.
 //!
-//! A link of ONE is also valid: a single core with no SIO driver, which is
-//! mgba's model of a GBA with nothing plugged in. Together with
+//! A link of ONE is also valid: for a cable, a single core with no SIO
+//! driver — mgba's model of a GBA with nothing plugged in. Together with
 //! [`Link::capture_boot_state`] and [`Link::from_states`] that makes the
 //! cable itself dynamic — a solo machine runs until peers appear, the
 //! captures are exchanged, and every peer rebuilds the full link mid-game
 //! (the cable plugs in); when the session ends, the local capture continues
 //! as a solo link again (the cable unplugs).
+//!
+//! A link may instead be built around the wireless adapter
+//! ([`Peripheral::Wireless`]): every core gets its own emulated AGB-015
+//! plugged into its link port, and the adapters share one airwaves
+//! coordinator that synchronizes the cores only at a coarse RF tick. A
+//! solo wireless link still installs the driver — a lone wireless game
+//! talks to its adapter (login, broadcast, scan) even with nobody else on
+//! the airwaves. Boot captures do not carry adapter state, so a link built
+//! from captures powers every adapter on fresh: games observe an adapter
+//! reset and re-run their wireless bring-up, the same way cable games
+//! re-announce their link mode after a plug-in.
 //!
 //! The cores are interleaved cooperatively on ONE thread (see
 //! `mgba::sio`): a tick runs whichever cores the lockstep protocol has not
@@ -58,9 +69,109 @@ pub struct Link {
     // calls back into its SIO driver, and detaching a driver touches the
     // coordinator.
     cores: Vec<mgba::core::OwnedCore>,
-    drivers: Vec<mgba::sio::Driver>,
+    drivers: Vec<Driver>,
     #[allow(dead_code)]
-    coordinator: mgba::sio::Coordinator,
+    coordinator: Coordinator,
+}
+
+/// Which link hardware a [`Link`]'s cores are wired to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Peripheral {
+    /// The multi-cable, through mgba's lockstep SIO driver.
+    #[default]
+    Cable,
+    /// The wireless adapter (AGB-015), through mgba's wireless SIO
+    /// driver: one emulated adapter per core, one shared airwaves.
+    Wireless,
+}
+
+// Held for ownership only (the drivers reference it until they drop).
+#[allow(dead_code)]
+enum Coordinator {
+    Cable(mgba::sio::Coordinator),
+    Wireless(mgba::sio::wireless::Coordinator),
+}
+
+enum Driver {
+    Cable(mgba::sio::Driver),
+    Wireless(mgba::sio::wireless::Driver),
+}
+
+impl Driver {
+    fn install(&mut self, core: &mut mgba::core::Core) {
+        match self {
+            Driver::Cable(d) => d.install(core),
+            Driver::Wireless(d) => d.install(core),
+        }
+    }
+
+    fn asleep(&self) -> bool {
+        match self {
+            Driver::Cable(d) => d.asleep(),
+            Driver::Wireless(d) => d.asleep(),
+        }
+    }
+
+    fn player_id(&self) -> i32 {
+        match self {
+            Driver::Cable(d) => d.player_id(),
+            Driver::Wireless(d) => d.player_id(),
+        }
+    }
+
+    fn save_state(&mut self) -> Vec<u8> {
+        match self {
+            Driver::Cable(d) => d.save_state(),
+            Driver::Wireless(d) => d.save_state(),
+        }
+    }
+
+    fn load_state(&mut self, blob: &[u8]) -> bool {
+        match self {
+            Driver::Cable(d) => d.load_state(blob),
+            Driver::Wireless(d) => d.load_state(blob),
+        }
+    }
+
+    fn save_adapter_state(&mut self) -> Option<Vec<u8>> {
+        match self {
+            Driver::Cable(_) => None,
+            Driver::Wireless(d) => Some(d.save_adapter_state()),
+        }
+    }
+
+    fn load_adapter_state(&mut self, blob: &[u8]) -> bool {
+        match self {
+            Driver::Cable(_) => false,
+            Driver::Wireless(d) => d.load_adapter_state(blob),
+        }
+    }
+}
+
+/// Build the coordinator plus one driver per player for the chosen
+/// peripheral. A solo cable installs no driver at all (a GBA with nothing
+/// plugged in); a solo wireless link still gets its adapter.
+fn build_drivers(peripheral: Peripheral, num_players: usize) -> (Coordinator, Vec<Driver>) {
+    match peripheral {
+        Peripheral::Cable => {
+            let mut coordinator = mgba::sio::Coordinator::new();
+            let drivers = if num_players > 1 {
+                (0..num_players)
+                    .map(|i| Driver::Cable(mgba::sio::Driver::new(&mut coordinator, i as i32)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (Coordinator::Cable(coordinator), drivers)
+        }
+        Peripheral::Wireless => {
+            let mut coordinator = mgba::sio::wireless::Coordinator::new();
+            let drivers = (0..num_players)
+                .map(|i| Driver::Wireless(mgba::sio::wireless::Driver::new(&mut coordinator, i as i32)))
+                .collect();
+            (Coordinator::Wireless(coordinator), drivers)
+        }
+    }
 }
 
 /// A consistent snapshot of the whole linked system: every core plus every
@@ -166,22 +277,29 @@ pub struct SideOptions {
 #[derive(Default)]
 pub struct LinkOptions {
     /// One entry per player, 1 to [`MAX_PLAYERS`]. Core `i` runs `sides[i]`
-    /// and requests lockstep player `i`. A single side boots with no SIO
-    /// driver at all — mgba's model of a GBA with nothing plugged in.
+    /// and requests player `i`. A single CABLE side boots with no SIO
+    /// driver at all — mgba's model of a GBA with nothing plugged in; a
+    /// single wireless side still gets its adapter.
     pub sides: Vec<SideOptions>,
     /// Pin every cart's RTC to a fixed clock. Mandatory for netplay/replay
     /// of RTC-bearing games (e.g. BN4.5): all peers must negotiate the
     /// same match clock or the link diverges on the first RTC read.
     pub rtc: Option<std::time::SystemTime>,
+    /// The link hardware on every core's port. All sides share one
+    /// peripheral; a mixed link is not a thing that exists.
+    pub peripheral: Peripheral,
 }
 
 /// One side of a link booted from a live capture instead of power-on: the
-/// ROM, the SRAM/flash image at capture time, and the serialized core state
-/// from [`Link::capture_boot_state`].
+/// ROM, the SRAM/flash image at capture time, the serialized core state
+/// from [`Link::capture_boot_state`], and — for a wireless link — the
+/// adapter session from [`Link::capture_adapter_state`], so the machine's
+/// adapter resumes where it was instead of power-cycling.
 pub struct BootSide {
     pub rom: Vec<u8>,
     pub save: Option<Vec<u8>>,
     pub state: Vec<u8>,
+    pub adapter: Option<Vec<u8>>,
 }
 
 impl Link {
@@ -192,6 +310,7 @@ impl Link {
         Self::with_options(LinkOptions {
             sides: roms.into_iter().map(|rom| SideOptions { rom, save: None }).collect(),
             rtc: None,
+            peripheral: Peripheral::Cable,
         })
     }
 
@@ -202,19 +321,12 @@ impl Link {
             "a link takes 1 to {MAX_PLAYERS} players, got {num_players}"
         );
 
-        let mut coordinator = mgba::sio::Coordinator::new();
+        let (coordinator, mut drivers) = build_drivers(options.peripheral, num_players);
         let core_options = mgba::core::Options::default();
 
         let mut cores = (0..num_players)
             .map(|_| mgba::core::OwnedCore::new_gba("mgba-siolink", &core_options))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut drivers = if num_players > 1 {
-            (0..num_players)
-                .map(|i| mgba::sio::Driver::new(&mut coordinator, i as i32))
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
 
         for (i, (core, side)) in cores.iter_mut().zip(options.sides).enumerate() {
             core.enable_video_buffer();
@@ -252,21 +364,27 @@ impl Link {
     /// deliberately lossy in a few corners, and everyone must agree on the
     /// reconstruction).
     ///
-    /// A single side is the unplugged continuation of a capture: no driver,
-    /// no coordinator registration.
-    pub fn from_states(sides: Vec<BootSide>, rtc: Option<std::time::SystemTime>) -> Result<Self, mgba::Error> {
+    /// A single CABLE side is the unplugged continuation of a capture: no
+    /// driver, no coordinator registration. A single wireless side keeps
+    /// its adapter and its adapter session — the unplug is the other
+    /// players leaving RF range, nothing more.
+    pub fn from_states(
+        sides: Vec<BootSide>,
+        rtc: Option<std::time::SystemTime>,
+        peripheral: Peripheral,
+    ) -> Result<Self, mgba::Error> {
         let num_players = sides.len();
         assert!(
             (1..=MAX_PLAYERS).contains(&num_players),
             "a link takes 1 to {MAX_PLAYERS} players, got {num_players}"
         );
 
-        let mut coordinator = mgba::sio::Coordinator::new();
         let core_options = mgba::core::Options::default();
 
         let mut cores = (0..num_players)
             .map(|_| mgba::core::OwnedCore::new_gba("mgba-siolink", &core_options))
             .collect::<Result<Vec<_>, _>>()?;
+        let mut adapters = Vec::with_capacity(num_players);
         for (core, side) in cores.iter_mut().zip(sides) {
             core.enable_video_buffer();
             core.load_rom(mgba::vfile::VFile::from_vec(side.rom))?;
@@ -277,19 +395,35 @@ impl Link {
                 core.set_rtc_fixed(rtc);
             }
             core.reset();
-            load_boot_state(core, &side.state)?;
+            match peripheral {
+                // The capture describes the OLD cable; neutralize the
+                // cable-dependent SIO state so the game re-announces its
+                // link mode to the new one.
+                Peripheral::Cable => load_boot_state(core, &side.state)?,
+                // The adapter is the SAME adapter: the core state (its
+                // half of any in-flight exchange included) and the
+                // adapter blob form a consistent local pair, so nothing
+                // is neutralized and nothing is descheduled.
+                Peripheral::Wireless => load_boot_state_verbatim(core, &side.state)?,
+            }
+            adapters.push(side.adapter);
         }
 
-        // The cable plugs in: attach in player order, deterministically.
-        let mut drivers = if num_players > 1 {
-            (0..num_players)
-                .map(|i| mgba::sio::Driver::new(&mut coordinator, i as i32))
-                .collect::<Vec<_>>()
-        } else {
-            Vec::new()
-        };
+        // The cable plugs in (or the adapters come into range): attach in
+        // player order, deterministically.
+        let (coordinator, mut drivers) = build_drivers(peripheral, num_players);
         for (core, driver) in cores.iter_mut().zip(drivers.iter_mut()) {
             driver.install(core);
+        }
+        // Attach powered the adapters on fresh; put each captured session
+        // back. Every peer injects the same blobs in the same order, so
+        // the merged airwaves is bit-identical everywhere.
+        for (driver, blob) in drivers.iter_mut().zip(adapters.iter()) {
+            if let Some(blob) = blob {
+                if !driver.load_adapter_state(blob) {
+                    return Err(mgba::Error::CallFailed("GBASIOWirelessDriverLoadAdapterState"));
+                }
+            }
         }
 
         Ok(Link {
@@ -309,6 +443,15 @@ impl Link {
     pub fn capture_boot_state(&mut self, i: usize) -> Result<Vec<u8>, mgba::Error> {
         let state = self.cores[i].save_state()?;
         Ok(state.as_slice().to_vec())
+    }
+
+    /// Core `i`'s live adapter session, the wireless pair to
+    /// [`Link::capture_boot_state`] (`None` on a cable link, which has no
+    /// adapter). Valid at any tick boundary; feed it to
+    /// [`Link::from_states`] as [`BootSide::adapter`] so the machine and
+    /// its adapter resume as one.
+    pub fn capture_adapter_state(&mut self, i: usize) -> Option<Vec<u8>> {
+        self.drivers.get_mut(i).and_then(|d| d.save_adapter_state())
     }
 
     /// Core `i`'s current SRAM/flash/EEPROM image, or `None` if the game
@@ -514,6 +657,21 @@ fn load_boot_state(core: &mut mgba::core::Core, blob: &[u8]) -> Result<(), mgba:
         (*gba).sio.mode = mode as mgba_sys::GBASIOMode;
     }
     Ok(())
+}
+
+/// Load a serialized boot state exactly as captured, with no SIO surgery:
+/// the wireless path, where the peripheral on the port is the same
+/// adapter the capture was talking to (its session travels separately in
+/// the adapter blob) and any pending transfer completion belongs to a
+/// local exchange that is being restored consistently.
+fn load_boot_state_verbatim(core: &mut mgba::core::Core, blob: &[u8]) -> Result<(), mgba::Error> {
+    if blob.len() != std::mem::size_of::<mgba::state::State>() {
+        return Err(mgba::Error::CallFailed("boot state has the wrong length"));
+    }
+    // Sound per State::from_slice's contract: exact size, and the bytes came
+    // from capture_boot_state on a compatible core.
+    let state = unsafe { mgba::state::State::from_slice(blob) };
+    core.load_state(&state)
 }
 
 /// Raw C-side view of a core's GBA, for the state surgery in this module

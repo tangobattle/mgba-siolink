@@ -3,7 +3,7 @@
 //! bit-identical across peers, rollback works on the plugged-in link, and
 //! a side extracted from the link continues alone (the cable unplugs).
 
-use mgba_siolink::{testrom, BootSide, Link};
+use mgba_siolink::{testrom, BootSide, Link, Peripheral};
 
 fn read_log(link: &mut Link, core: usize, halfwords: usize) -> Vec<u16> {
     let mut buf = vec![0u8; halfwords * 2];
@@ -53,9 +53,11 @@ fn plug_in_exchange_and_unplug() {
                     rom: rom.clone(),
                     save: saves[i].clone(),
                     state: states[i].clone(),
+                    adapter: None,
                 })
                 .collect(),
             None,
+            Peripheral::Cable,
         )
         .unwrap()
     };
@@ -120,8 +122,10 @@ fn plug_in_exchange_and_unplug() {
             rom: rom.clone(),
             save,
             state,
+            adapter: None,
         }],
         None,
+        Peripheral::Cable,
     )
     .unwrap();
     let before = alone.core(0).frame_counter();

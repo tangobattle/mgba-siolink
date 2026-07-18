@@ -143,6 +143,24 @@ pub fn payload(id: usize, c: usize) -> u16 {
     ((c + 1) as u16 & 0x3FFF) | ((id as u16) << 14)
 }
 
+/// A ROM that does nothing at all: the CPU spins while the machine's
+/// timers and events advance. The wireless protocol tests drive the SIO
+/// registers from outside the emulated CPU, so the game itself must keep
+/// its hands off them.
+pub fn build_idle() -> Vec<u8> {
+    let mut asm = Asm { words: Vec::new() };
+    asm.emit(Asm::branch_word(AL, 0, ENTRY_WORD as usize));
+    while asm.here() < ENTRY_WORD as usize {
+        asm.emit(0);
+    }
+    let spin = asm.here();
+    asm.branch(AL, spin);
+
+    let mut bytes: Vec<u8> = asm.words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    bytes.resize(1024, 0);
+    bytes
+}
+
 pub fn build() -> Vec<u8> {
     let mut asm = Asm { words: Vec::new() };
 
