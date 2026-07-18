@@ -601,3 +601,86 @@ fn merging_solo_links_brings_players_into_range() {
     // Disconnected and idle — but still logged in and addressable.
     assert_eq!(ok(&mut alone, 0, 0x13, &[]), vec![0]);
 }
+
+/// Payload bytes that happen to spell "NI" (0x494E, the first login
+/// word's low half) must ride through data commands untouched — a real
+/// adapter only re-enters login on the SD reset pulse, never from
+/// in-band data. (A guard that keyed on the bytes power-cycled the
+/// adapter mid-session whenever game data contained "NI".)
+#[test]
+fn ni_bytes_in_payloads_do_not_reset_the_adapter() {
+    let mut link = wireless_link(2);
+    login(&mut link, 0);
+    login(&mut link, 1);
+    host(&mut link, 0);
+    join(&mut link, 1, 0x61F0);
+
+    // "NI" in the client's upload and in the host's payload.
+    ok(&mut link, 1, 0x24, &[4 << 8, 0x0000_494E]);
+    ok(&mut link, 0, 0x24, &[4, 0x494E_494E]);
+    tick(&mut link);
+    assert_eq!(ok(&mut link, 0, 0x26, &[]), vec![4 << 8, 0x0000_494E]);
+    assert_eq!(ok(&mut link, 1, 0x26, &[]), vec![4, 0x494E_494E]);
+
+    // Nobody got power-cycled: both adapters still hold their sessions.
+    assert_eq!(ok(&mut link, 0, 0x13, &[]), vec![0x0200_61F0]);
+    assert_eq!(ok(&mut link, 1, 0x13, &[]), vec![0x0501_61F1]);
+}
+
+/// librfu's DMA-collision recovery can abandon a slave session at any
+/// point — after the event header, before the ack, without the SO/SI
+/// dance. The adapter must resend the frame for a re-armed slave, and a
+/// master-mode command must always find a clean handshake line (a stale
+/// "answer SO-high with SI-high" debt would spin handshake_wait
+/// forever: the hard-lockup bug).
+#[test]
+fn abandoned_event_frames_recover() {
+    let mut link = wireless_link(2);
+    login(&mut link, 0);
+    login(&mut link, 1);
+    host(&mut link, 0);
+    join(&mut link, 1, 0x61F0);
+
+    // Client waits; host transmits; the event header arrives.
+    ok(&mut link, 1, 0x27, &[]);
+    set_data32(&mut link, 1, IDLE);
+    write_siocnt(&mut link, 1, CNT_SLAVE);
+    write_siocnt(&mut link, 1, CNT_SLAVE_GO);
+    ok(&mut link, 0, 0x24, &[1, 0x0000_0077]);
+    for _ in 0..8 {
+        if siocnt(&mut link, 1) & 0x80 == 0 {
+            break;
+        }
+        tick(&mut link);
+    }
+    assert_eq!(data32(&mut link, 1), 0x9966_0028);
+
+    // DMA recovery: no dance, no ack — just a fresh slave arm with the
+    // idle word preloaded, waiting for a header. The adapter must
+    // restart the frame.
+    set_data32(&mut link, 1, IDLE);
+    write_siocnt(&mut link, 1, CNT_SLAVE_GO);
+    for _ in 0..4 {
+        if siocnt(&mut link, 1) & 0x80 == 0 {
+            break;
+        }
+        tick(&mut link);
+    }
+    assert_eq!(data32(&mut link, 1), IDLE, "the ack-phase transfer answers idle");
+    set_data32(&mut link, 1, IDLE);
+    write_siocnt(&mut link, 1, CNT_SLAVE_GO);
+    for _ in 0..4 {
+        if siocnt(&mut link, 1) & 0x80 == 0 {
+            break;
+        }
+        tick(&mut link);
+    }
+    assert_eq!(data32(&mut link, 1), 0x9966_0028, "the frame must resend its header");
+
+    // Now abandon the slave session entirely — no dance, no ack — and
+    // talk as master. The command must work and every handshake level
+    // must read exactly as librfu's spin loops expect.
+    assert_eq!(ok(&mut link, 1, 0x13, &[]), vec![0x0501_61F1]);
+    // The host's payload survived all of it.
+    assert_eq!(ok(&mut link, 1, 0x26, &[]), vec![1, 0x0000_0077]);
+}
