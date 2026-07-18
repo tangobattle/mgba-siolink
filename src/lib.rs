@@ -41,9 +41,21 @@ pub mod session;
 pub mod testrom;
 pub mod throttler;
 
-/// The most players one link supports — mgba's `MAX_GBAS`, the size of a
-/// real multi-cable chain.
-pub const MAX_PLAYERS: usize = 4;
+/// The most players a cable link supports — mgba's `MAX_GBAS`, the size
+/// of a real multi-cable chain (the SIO multi protocol has two player-id
+/// bits; four is physical law).
+pub const MAX_CABLE_PLAYERS: usize = 4;
+
+/// The most players a wireless link supports. The airwaves themselves
+/// are uncapped — any number of ≤5-player RFU host groups can share
+/// spectrum, union-room style — but the coordinator parks players on a
+/// 64-bit bitmask (`WL_MAX_ATTACHED` in wireless.c), so one link holds
+/// at most 63 GBAs.
+pub const MAX_WIRELESS_PLAYERS: usize = 63;
+
+/// The most players any link supports (the wireless bound; cable links
+/// cap lower — see [`Peripheral::max_players`]).
+pub const MAX_PLAYERS: usize = MAX_WIRELESS_PLAYERS;
 
 // GBA io block indices (register address >> 1), for the boot-capture
 // cable neutralization.
@@ -83,6 +95,16 @@ pub enum Peripheral {
     /// The wireless adapter (AGB-015), through mgba's wireless SIO
     /// driver: one emulated adapter per core, one shared airwaves.
     Wireless,
+}
+
+impl Peripheral {
+    /// The most players a link built on this peripheral holds.
+    pub fn max_players(self) -> usize {
+        match self {
+            Peripheral::Cable => MAX_CABLE_PLAYERS,
+            Peripheral::Wireless => MAX_WIRELESS_PLAYERS,
+        }
+    }
 }
 
 // Held for ownership only (the drivers reference it until they drop).
@@ -316,9 +338,11 @@ impl Link {
 
     pub fn with_options(options: LinkOptions) -> Result<Self, mgba::Error> {
         let num_players = options.sides.len();
+        let max_players = options.peripheral.max_players();
         assert!(
-            (1..=MAX_PLAYERS).contains(&num_players),
-            "a link takes 1 to {MAX_PLAYERS} players, got {num_players}"
+            (1..=max_players).contains(&num_players),
+            "a {:?} link takes 1 to {max_players} players, got {num_players}",
+            options.peripheral,
         );
 
         let (coordinator, mut drivers) = build_drivers(options.peripheral, num_players);
@@ -374,9 +398,10 @@ impl Link {
         peripheral: Peripheral,
     ) -> Result<Self, mgba::Error> {
         let num_players = sides.len();
+        let max_players = peripheral.max_players();
         assert!(
-            (1..=MAX_PLAYERS).contains(&num_players),
-            "a link takes 1 to {MAX_PLAYERS} players, got {num_players}"
+            (1..=max_players).contains(&num_players),
+            "a {peripheral:?} link takes 1 to {max_players} players, got {num_players}",
         );
 
         let core_options = mgba::core::Options::default();

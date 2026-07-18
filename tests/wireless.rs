@@ -463,6 +463,84 @@ fn four_players_share_one_host() {
 }
 
 #[test]
+fn five_players_fill_the_host() {
+    // The RFU maximum for one group: a host plus WL_MAX_CLIENTS.
+    let mut link = wireless_link(5);
+    for i in 0..5 {
+        login(&mut link, i);
+    }
+    host(&mut link, 0);
+    for c in 1..5 {
+        let status = join(&mut link, c, 0x61F0);
+        assert_eq!(status, ((c as u32 - 1) << 16) | (0x61F0 + c as u32));
+    }
+    // The host's roster: every slot seated, no next slot left (0xFF).
+    assert_eq!(
+        ok(&mut link, 0, 0x14, &[]),
+        vec![0x0000_00FF, 0x0000_61F1, 0x0001_61F2, 0x0002_61F3, 0x0003_61F4]
+    );
+
+    // Everyone schedules an upload; one host frame collects all four.
+    for c in 1..5 {
+        ok(&mut link, c, 0x24, &[2 << (8 + 5 * (c - 1)), 0x1100 * c as u32]);
+    }
+    ok(&mut link, 0, 0x24, &[4, 0xF00D_F00D]);
+    tick(&mut link);
+
+    let host_rx = ok(&mut link, 0, 0x26, &[]);
+    assert_eq!(host_rx[0], (2 << 8) | (2 << 13) | (2 << 18) | (2 << 23));
+    // Bytes 00 11 | 00 22 | 00 33 | 00 44, concatenated, read as LE words.
+    assert_eq!(host_rx[1..], [0x2200_1100, 0x4400_3300]);
+    for c in 1..5 {
+        assert_eq!(ok(&mut link, c, 0x26, &[]), vec![4, 0xF00D_F00D]);
+    }
+}
+
+#[test]
+fn crowded_airwaves_form_more_groups() {
+    // Seven GBAs on one airwave — more than any single RFU group holds.
+    // The coordinator itself is uncapped; WL_MAX_CLIENTS is what caps a
+    // group, so the overflow forms a second one, union-room style.
+    let mut link = wireless_link(7);
+    for i in 0..7 {
+        login(&mut link, i);
+    }
+    host(&mut link, 0);
+    for c in 1..5 {
+        join(&mut link, c, 0x61F0);
+    }
+
+    // The sixth player bounces off the full host: connect resolves to
+    // status 2 (closed/full).
+    ok(&mut link, 5, 0x1F, &[0x61F0]);
+    tick(&mut link);
+    assert_eq!(ok(&mut link, 5, 0x20, &[])[0], 0x0200_0000);
+
+    // So it opens a group of its own, and the seventh joins that one —
+    // the scan shows both hosts, entries in player order, the full one
+    // advertising no next slot.
+    host(&mut link, 5);
+    ok(&mut link, 6, 0x1C, &[]);
+    tick(&mut link);
+    let servers = ok(&mut link, 6, 0x1D, &[]);
+    assert_eq!(servers.len(), 14, "two hosts should broadcast: {servers:08X?}");
+    assert_eq!(servers[0], 0x00FF_61F0);
+    assert_eq!(servers[7] & 0xFFFF, 0x61F5);
+    ok(&mut link, 6, 0x1E, &[]);
+    ok(&mut link, 6, 0x1F, &[0x61F5]);
+    let mut status = ok(&mut link, 6, 0x20, &[])[0];
+    for _ in 0..4 {
+        if status != 0x0100_0000 {
+            break;
+        }
+        tick(&mut link);
+        status = ok(&mut link, 6, 0x20, &[])[0];
+    }
+    // Slot 0 of the second host, under its own device id.
+    assert_eq!(status, 0x61F6);
+}
+
+#[test]
 fn wireless_snapshots_restore_exactly() {
     // Drive the same scripted exchange twice across a snapshot restore;
     // every digest and every read must repeat. This is the property
