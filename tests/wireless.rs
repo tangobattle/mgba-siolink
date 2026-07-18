@@ -517,15 +517,21 @@ fn crowded_airwaves_form_more_groups() {
     assert_eq!(ok(&mut link, 5, 0x20, &[])[0], 0x0200_0000);
 
     // So it opens a group of its own, and the seventh joins that one —
-    // the scan shows both hosts, entries in player order, the full one
+    // the scan shows both hosts (entry order rotates with the shared
+    // clock; see the rotating fill window in _rfCommit), the full one
     // advertising no next slot.
     host(&mut link, 5);
     ok(&mut link, 6, 0x1C, &[]);
     tick(&mut link);
     let servers = ok(&mut link, 6, 0x1D, &[]);
     assert_eq!(servers.len(), 14, "two hosts should broadcast: {servers:08X?}");
-    assert_eq!(servers[0], 0x00FF_61F0);
-    assert_eq!(servers[7] & 0xFFFF, 0x61F5);
+    let mut entries: Vec<u32> = servers.chunks(7).map(|c| c[0]).collect();
+    entries.sort_unstable();
+    assert_eq!(
+        entries,
+        vec![0x0000_61F5, 0x00FF_61F0],
+        "both hosts visible, the full one advertising no next slot"
+    );
     ok(&mut link, 6, 0x1E, &[]);
     ok(&mut link, 6, 0x1F, &[0x61F5]);
     let mut status = ok(&mut link, 6, 0x20, &[])[0];
@@ -865,4 +871,89 @@ fn airwaves_survive_the_cycle_counter_sign_wrap() {
         rd(snap.driver_blob(0), OFF_COORD_CYCLE) < 0,
         "test did not actually cross the boundary"
     );
+}
+
+/// Reproduces the union-room entry hang: Emerald's
+/// IsWirelessAdapterConnected logs in, sends 0x3D (stop mode), and the
+/// union room then revives the adapter by clocking probe words and
+/// watching for the login sequence in the REPLIES — the adapter leads
+/// the NINTENDO handshake, and there is no SD pulse anywhere in the
+/// path. A dormant state that only woke on the GPIO pulse ate the 0x3D
+/// ack and ignored the probes; librfu gave up after five and every
+/// union-room entry hung at the attendant.
+#[test]
+fn stop_mode_revives_on_probe_without_a_pulse() {
+    let mut link = wireless_link(1);
+    login(&mut link, 0);
+    // 0x3D acks through the normal flow; its ack-fetch exchange is
+    // itself the revival (any master-clocked word at a dormant adapter
+    // powers it on into a fresh login).
+    ok(&mut link, 0, 0x3D, &[]);
+
+    // The adapter now leads the handshake: a bare probe reads NI.
+    assert_eq!(xfer_at(&mut link, 0, 0x1001, IDLE), 0x494E_FFFF);
+    // The rest of the canonical trace, replies derived from the same
+    // machine as login()'s — only the first ack differs (the probe
+    // word above carried no echo half).
+    let trace = [
+        (0xB6B1494Eu32, 0x494EFFFFu32),
+        (0xB6B1544E, 0x544EB6B1),
+        (0xABB1544E, 0x544EABB1),
+        (0xABB14E45, 0x4E45ABB1),
+        (0xB1BA4E45, 0x4E45B1BA),
+        (0xB1BA4F44, 0x4F44B1BA),
+        (0xB0BB4F44, 0x4F44B0BB),
+        (0xB0BB8001, 0x8001B0BB),
+    ];
+    for (t, (send, expect)) in trace.iter().enumerate() {
+        let got = xfer_at(&mut link, 0, 0x1001, *send);
+        assert_eq!(got, *expect, "revival login word {t}: got {got:08X}");
+    }
+    // Fresh session, command mode reached.
+    let (ack, _) = command(&mut link, 0, 0x11, &[]);
+    assert_eq!(ack, 0x91, "post-revival command mode broken");
+}
+
+/// Ten players attach before any core runs: each earlier player's event
+/// queue collects one ATTACH per later joiner, which overflowed the
+/// 8-entry pool at the tenth player and walked a NULL freeList. The
+/// enqueue now drops bookkeeping events on exhaustion instead.
+#[test]
+fn ten_players_attach_without_overflowing_event_pools() {
+    let mut link = wireless_link(10);
+    for _ in 0..8 {
+        tick(&mut link);
+    }
+}
+
+/// A scan snapshot caps at WL_MAX_SCAN_RESULTS hosts, and a fixed fill
+/// order made the lowest player ids hog every snapshot — on airwaves
+/// with ten broadcasters (a full union room), players 4+ were invisible
+/// to everyone, forever. The fill window now rotates with the shared
+/// clock, so successive polls surface every host.
+#[test]
+fn crowded_scans_rotate_through_every_host() {
+    let mut link = wireless_link(10);
+    for i in 0..10 {
+        login(&mut link, i);
+    }
+    for i in 0..10 {
+        host(&mut link, i);
+    }
+    ok(&mut link, 9, 0x1C, &[]);
+    let mut seen = std::collections::HashSet::new();
+    for _ in 0..40 {
+        tick(&mut link);
+        let servers = ok(&mut link, 9, 0x1D, &[]);
+        assert!(servers.len() % 7 == 0);
+        for chunk in servers.chunks(7) {
+            seen.insert((chunk[0] & 0xFFFF) as u16);
+        }
+    }
+    for pid in 0..9u16 {
+        assert!(
+            seen.contains(&(0x61F0 + pid)),
+            "host {pid} never surfaced in any scan snapshot: {seen:?}"
+        );
+    }
 }
