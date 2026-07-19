@@ -957,3 +957,147 @@ fn crowded_scans_rotate_through_every_host() {
         );
     }
 }
+
+/// The guarantee behind stable seats: a mid-roster departure must not
+/// sever the connections of players who did not depart. Host A (seat 0)
+/// serves clients B (seat 1, slot 0) and C (seat 2, slot 1); B leaves
+/// and the roster compacts to [A, C]. The rebuilt link hands every
+/// survivor its captured seat back, so A–C ride through untouched —
+/// same device ids, same slot, data still flowing — and only B's slot
+/// frees, exactly as if B alone walked out of range.
+#[test]
+fn mid_roster_departure_keeps_survivor_connections() {
+    let mut link = wireless_link(3);
+    for i in 0..3 {
+        login(&mut link, i);
+    }
+    host(&mut link, 0);
+    assert_eq!(join(&mut link, 1, 0x61F0), 0x0000_61F1);
+    assert_eq!(join(&mut link, 2, 0x61F0), 0x0001_61F2);
+
+    let capture = |link: &mut Link, i: usize| BootSide {
+        rom: testrom::build_idle(),
+        save: link.export_save(i),
+        state: link.capture_boot_state(i).unwrap(),
+        adapter: link.capture_adapter_state(i),
+    };
+    let (side_a, side_c) = (capture(&mut link, 0), capture(&mut link, 2));
+    let clone_side = |side: &BootSide| BootSide {
+        rom: side.rom.clone(),
+        save: side.save.clone(),
+        state: side.state.clone(),
+        adapter: side.adapter.clone(),
+    };
+    let build = || {
+        Link::from_states(
+            vec![clone_side(&side_a), clone_side(&side_c)],
+            None,
+            Peripheral::Wireless,
+        )
+        .unwrap()
+    };
+
+    // Every peer rebuilds the identical machine, seats included.
+    let mut peer_a = build();
+    let mut peer_b = build();
+    for t in 0..60 {
+        tick(&mut peer_a);
+        tick(&mut peer_b);
+        if t % 20 == 19 {
+            let d_a = peer_a.save().unwrap().digest();
+            let d_b = peer_b.save().unwrap().digest();
+            assert_eq!(d_a, d_b, "rebuilt links diverged at tick {t}");
+        }
+    }
+
+    let mut link = peer_a;
+    // The roster compacted but the seats did not: A keeps 0, C keeps 2.
+    assert_eq!(link.player_id(0), 0);
+    assert_eq!(link.player_id(1), 2);
+
+    // A still hosts under its id; C is still its slot-1 client under
+    // its id — no disconnect event, no re-join.
+    assert_eq!(ok(&mut link, 0, 0x13, &[]), vec![0x0200_61F0]);
+    assert_eq!(ok(&mut link, 1, 0x13, &[]), vec![0x0502_61F2]);
+    // The host's roster: B's slot 0 freed by the liveness sweep, C
+    // seated at slot 1 as ever.
+    assert_eq!(ok(&mut link, 0, 0x14, &[]), vec![0x0000_0000, 0x0001_61F2]);
+
+    // And the connection is live, not just reported: one RF frame still
+    // moves data both ways, C's upload in its slot-1 lane.
+    ok(&mut link, 1, 0x24, &[2 << 13, 0x0000_CAFE]);
+    ok(&mut link, 0, 0x24, &[4, 0xDDCC_BBAA]);
+    tick(&mut link);
+    assert_eq!(ok(&mut link, 0, 0x26, &[]), vec![2 << 13, 0x0000_CAFE]);
+    assert_eq!(ok(&mut link, 1, 0x26, &[]), vec![4, 0xDDCC_BBAA]);
+
+    // C alone (the room died): the continuation keeps seat 2, and the
+    // first RF sweep resolves the host as walked-out-of-range.
+    let side_c = capture(&mut link, 1);
+    let mut alone = Link::from_states(vec![side_c], None, Peripheral::Wireless).unwrap();
+    assert_eq!(alone.player_id(0), 2);
+    tick(&mut alone);
+    tick(&mut alone);
+    assert_eq!(ok(&mut alone, 0, 0x13, &[]), vec![0]);
+}
+
+/// A departed seat is a hole the next joiner fills. After B leaves
+/// [A, C], fresh machine D — whose solo capture claims seat 0, as every
+/// solo boot does — merges in: A holds seat 0 (attach order wins), so D
+/// lands in B's hole at seat 1, and the incumbents' connection again
+/// rides through. D then joins A's group in B's freed slot 0.
+#[test]
+fn a_late_joiner_fills_the_departed_seat() {
+    let mut link = wireless_link(3);
+    for i in 0..3 {
+        login(&mut link, i);
+    }
+    host(&mut link, 0);
+    join(&mut link, 1, 0x61F0);
+    join(&mut link, 2, 0x61F0);
+
+    let capture = |link: &mut Link, i: usize| BootSide {
+        rom: testrom::build_idle(),
+        save: link.export_save(i),
+        state: link.capture_boot_state(i).unwrap(),
+        adapter: link.capture_adapter_state(i),
+    };
+    let (side_a, side_c) = (capture(&mut link, 0), capture(&mut link, 2));
+
+    // D: a fresh solo machine, logged in and idle.
+    let mut d = wireless_link(1);
+    login(&mut d, 0);
+    tick(&mut d);
+    let side_d = capture(&mut d, 0);
+    assert_eq!(
+        mgba_siolink::Link::from_states(vec![capture(&mut d, 0)], None, Peripheral::Wireless)
+            .unwrap()
+            .player_id(0),
+        0,
+        "a solo capture claims seat 0",
+    );
+
+    let mut link =
+        Link::from_states(vec![side_a, side_c, side_d], None, Peripheral::Wireless).unwrap();
+    tick(&mut link);
+    tick(&mut link);
+
+    // A keeps 0, C keeps 2; D wanted 0, lost it to the incumbent, and
+    // took the hole B left.
+    assert_eq!(link.player_id(0), 0);
+    assert_eq!(link.player_id(1), 2);
+    assert_eq!(link.player_id(2), 1);
+
+    // The incumbents' connection survived D's arrival too.
+    assert_eq!(ok(&mut link, 0, 0x13, &[]), vec![0x0200_61F0]);
+    assert_eq!(ok(&mut link, 1, 0x13, &[]), vec![0x0502_61F2]);
+
+    // D scans, finds A, and joins in B's freed slot 0 under B's old
+    // device id (seat 1) — id reuse, exactly like real adapters rolling
+    // a previously seen id.
+    assert_eq!(join(&mut link, 2, 0x61F0), 0x0000_61F1);
+    assert_eq!(
+        ok(&mut link, 0, 0x14, &[]),
+        vec![0x0000_0002, 0x0000_61F1, 0x0001_61F2]
+    );
+}

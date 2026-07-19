@@ -23,10 +23,12 @@
 //! coordinator that synchronizes the cores only at a coarse RF tick. A
 //! solo wireless link still installs the driver — a lone wireless game
 //! talks to its adapter (login, broadcast, scan) even with nobody else on
-//! the airwaves. Boot captures do not carry adapter state, so a link built
-//! from captures powers every adapter on fresh: games observe an adapter
-//! reset and re-run their wireless bring-up, the same way cable games
-//! re-announce their link mode after a plug-in.
+//! the airwaves. A wireless capture carries its adapter session AND its
+//! seat ([`Link::capture_adapter_state`]), so a link rebuilt mid-game
+//! resumes every adapter where it was, under the identity it had:
+//! membership changes never renumber a surviving adapter, so the
+//! connections among survivors ride through a rebuild and only pairings
+//! with a departed player drop (as an in-range disconnect games handle).
 //!
 //! The cores are interleaved cooperatively on ONE thread (see
 //! `mgba::sio`): a tick runs whichever cores the lockstep protocol has not
@@ -173,12 +175,18 @@ impl Driver {
 /// Build the coordinator plus one driver per player for the chosen
 /// peripheral. A solo cable installs no driver at all (a GBA with nothing
 /// plugged in); a solo wireless link still gets its adapter.
-fn build_drivers(peripheral: Peripheral, num_players: usize) -> (Coordinator, Vec<Driver>) {
+///
+/// `seats` has one entry per player: the wireless seat (playerId) each
+/// adapter asks for, `-1` for any free one. A fresh link passes
+/// positions; a rebuild passes each capture's recorded seat so every
+/// adapter keeps its airwaves identity (see [`Link::from_states`]).
+/// Cable player ids are positional regardless.
+fn build_drivers(peripheral: Peripheral, seats: &[i32]) -> (Coordinator, Vec<Driver>) {
     match peripheral {
         Peripheral::Cable => {
             let mut coordinator = mgba::sio::Coordinator::new();
-            let drivers = if num_players > 1 {
-                (0..num_players)
+            let drivers = if seats.len() > 1 {
+                (0..seats.len())
                     .map(|i| Driver::Cable(mgba::sio::Driver::new(&mut coordinator, i as i32)))
                     .collect()
             } else {
@@ -188,8 +196,9 @@ fn build_drivers(peripheral: Peripheral, num_players: usize) -> (Coordinator, Ve
         }
         Peripheral::Wireless => {
             let mut coordinator = mgba::sio::wireless::Coordinator::new();
-            let drivers = (0..num_players)
-                .map(|i| Driver::Wireless(mgba::sio::wireless::Driver::new(&mut coordinator, i as i32)))
+            let drivers = seats
+                .iter()
+                .map(|&seat| Driver::Wireless(mgba::sio::wireless::Driver::new(&mut coordinator, seat)))
                 .collect();
             (Coordinator::Wireless(coordinator), drivers)
         }
@@ -353,7 +362,8 @@ impl Link {
             options.peripheral,
         );
 
-        let (coordinator, mut drivers) = build_drivers(options.peripheral, num_players);
+        let seats = (0..num_players as i32).collect::<Vec<_>>();
+        let (coordinator, mut drivers) = build_drivers(options.peripheral, &seats);
         let core_options = mgba::core::Options::default();
 
         let mut cores = (0..num_players)
@@ -443,8 +453,22 @@ impl Link {
         }
 
         // The cable plugs in (or the adapters come into range): attach in
-        // player order, deterministically.
-        let (coordinator, mut drivers) = build_drivers(peripheral, num_players);
+        // player order, deterministically. Each wireless side asks for
+        // the seat recorded in its capture — seats are sticky in the
+        // coordinator, so a rebuild after a departure leaves every
+        // survivor's airwaves identity (device id, connection
+        // references, its own game's cached ids) untouched, and only
+        // pairings with the departed actually drop. Blob-less sides
+        // (fresh joiners, pre-seat captures) take any free seat.
+        let seats = adapters
+            .iter()
+            .map(|blob| {
+                blob.as_deref()
+                    .and_then(mgba::sio::wireless::adapter_state_player_id)
+                    .unwrap_or(-1)
+            })
+            .collect::<Vec<_>>();
+        let (coordinator, mut drivers) = build_drivers(peripheral, &seats);
         for (core, driver) in cores.iter_mut().zip(drivers.iter_mut()) {
             driver.install(core);
         }
