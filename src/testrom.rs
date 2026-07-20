@@ -195,6 +195,56 @@ pub fn build() -> Vec<u8> {
     asm.emit(orr_imm(AL, 1, 1, 0, 0x03));
     asm.emit(strh(1, 0, 0x64)); // SOUND1CNT_X: restart, freq 0x403
 
+    // ch2: a second square at another odd-period pitch, with a DECAYING
+    // envelope — the envelope stepTime/direction/currentVolume walk is
+    // live state for the first second or so, then the channel dies
+    // (exercising the dead-channel path too).
+    asm.emit(mov_imm(1, 12, 0xF3));
+    asm.emit(strh(1, 0, 0x68)); // SOUND2CNT_L: vol 15, decay, step 3
+    asm.emit(mov_imm(1, 12, 0x86));
+    asm.emit(orr_imm(AL, 1, 1, 0, 0xB3));
+    asm.emit(strh(1, 0, 0x6C)); // SOUND2CNT_H: restart, freq 0x2B3
+
+    // ch3: an ASYMMETRIC wave pattern, so the wave-position window is
+    // audible phase state — a stale window after a savestate load reads
+    // the table from the wrong offset. Wave RAM is writable while
+    // playback is off.
+    asm.emit(mov_imm(1, 12, 0xFF));
+    asm.emit(strh(1, 0, 0x90));
+    asm.emit(mov_imm(1, 0, 0xFF));
+    asm.emit(strh(1, 0, 0x92));
+    asm.emit(mov_imm(1, 12, 0xF0));
+    asm.emit(strh(1, 0, 0x94));
+    asm.emit(mov_imm(1, 0, 0x0F));
+    asm.emit(strh(1, 0, 0x96));
+    asm.emit(mov_imm(1, 12, 0xFF));
+    asm.emit(strh(1, 0, 0x98));
+    asm.emit(mov_imm(1, 0, 0));
+    asm.emit(strh(1, 0, 0x9A));
+    asm.emit(mov_imm(1, 0, 0xFF));
+    asm.emit(orr_imm(AL, 1, 1, 12, 0xFF));
+    asm.emit(strh(1, 0, 0x9C));
+    asm.emit(mov_imm(1, 0, 0xF0));
+    asm.emit(strh(1, 0, 0x9E));
+    asm.emit(mov_imm(1, 0, 0x80));
+    asm.emit(strh(1, 0, 0x70)); // SOUND3CNT_L: playback on, bank 0
+    asm.emit(mov_imm(1, 10, 0x02));
+    asm.emit(strh(1, 0, 0x72)); // SOUND3CNT_H: volume 100%
+    // Rate chosen so a whole-tick span's window advance is far from
+    // 0 mod 32 — a stale window then can't alias away against the
+    // tests' rollback cadence (0x300 lands within ~0.02 steps of an
+    // exact multiple over 7 ticks and hides exactly that bug).
+    asm.emit(mov_imm(1, 12, 0x82));
+    asm.emit(orr_imm(AL, 1, 1, 0, 0xA5));
+    asm.emit(strh(1, 0, 0x74)); // SOUND3CNT_X: restart, rate 0x2A5
+
+    // ch4: noise at constant volume — LFSR + ratio/shift state.
+    asm.emit(mov_imm(1, 12, 0xF0));
+    asm.emit(strh(1, 0, 0x78)); // SOUND4CNT_L: vol 15, no envelope
+    asm.emit(mov_imm(1, 12, 0x80));
+    asm.emit(orr_imm(AL, 1, 1, 0, 0x37));
+    asm.emit(strh(1, 0, 0x7C)); // SOUND4CNT_H: restart, ratio 7 shift 3
+
     asm.emit(orr_imm(AL, 0, 0, 14, 0x12)); // r0 |= 0x120
     asm.emit(mov_imm(1, 0, 0));
     asm.emit(strh(1, 0, RCNT)); // RCNT = 0
