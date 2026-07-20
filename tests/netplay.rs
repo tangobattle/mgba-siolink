@@ -184,6 +184,60 @@ fn two_peer_convergence_and_replay() {
     }
 }
 
+/// A rollback replaces the revoked speculation's queued audio instead of
+/// appending to it. The ring's unplayed backlog voices exactly the ticks
+/// the rewind revokes; leaving it while the re-sim mixes those ticks
+/// again would hand the host duplicate audio for every rollback — the
+/// audible netplay stutter.
+#[test]
+fn rollback_audio_replaces_instead_of_appending() {
+    mgba::log::install_default_logger();
+    let rom = testrom::build();
+    let mut peer =
+        Session::new(Link::new(vec![rom.clone(), rom]).unwrap(), 0, DELAY).unwrap();
+    peer.with_link(|l| {
+        for i in 0..l.num_players() {
+            let core = l.core_mut(i);
+            core.set_audio_buffer_size(65536);
+            core.audio_buffer().clear();
+        }
+    });
+
+    // Settle a stretch where repeat-last prediction holds (the remote
+    // keeps holding 0), building an undrained backlog in the ring.
+    const SETTLED: u32 = 30;
+    for _ in 0..SETTLED {
+        let (_, rep) = peer.advance(0).unwrap();
+        assert_eq!(rep.rolled_back, 0, "matching inputs must not roll back");
+        peer.add_remote_input(1, 0, 0);
+    }
+    let backlog = peer.with_link(|l| l.core_mut(0).audio_buffer().available());
+    assert!(backlog > 0, "the test rom must queue audio for this test to bite");
+
+    // Speculate past the settled boundary, then land a contradiction
+    // for the first speculated tick.
+    const HELD: u32 = 4;
+    for _ in 0..HELD {
+        peer.advance(0).unwrap();
+    }
+    for _ in 0..HELD {
+        peer.add_remote_input(1, 0x3, 0);
+    }
+    let (_, rep) = peer.advance(0).unwrap();
+    assert!(rep.rolled_back > 0, "the contradiction must force a rollback");
+
+    let after = peer.with_link(|l| l.core_mut(0).audio_buffer().available());
+    // The re-simulated ticks refill the ring...
+    assert!(after > 0, "the re-sim must emit fresh audio");
+    // ...but the revoked backlog is gone. Appending would leave the ring
+    // strictly deeper than it was before the rollback.
+    assert!(
+        after < backlog,
+        "rollback appended to the audio ring instead of replacing it: \
+         {after} queued sample frames vs {backlog} before the rollback"
+    );
+}
+
 #[test]
 fn three_peer_convergence() {
     let run = run_mesh(3);

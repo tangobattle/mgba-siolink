@@ -191,6 +191,17 @@ impl getgud::World for LinkWorld {
             return Ok(());
         }
         shared.link.load(&state.snap)?;
+        // The mixed-output audio rings are playback state, not machine
+        // state: whatever is queued past this point voices the very
+        // speculation being revoked, and the re-simulation is about to
+        // mix those same ticks again. Left in place, the duplicates
+        // play as a repeat and ratchet the host's queue toward its
+        // backlog discard — the audible rollback stutter. Clear them so
+        // the re-sim replaces the revoked audio instead of appending
+        // to it.
+        for i in 0..shared.link.num_players() {
+            shared.link.core_mut(i).audio_buffer().clear();
+        }
         shared.live_tick = state.tick;
         if let Some(observer) = shared.observer.as_mut() {
             observer.on_rewind(state.tick);
