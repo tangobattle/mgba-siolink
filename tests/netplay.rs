@@ -184,17 +184,18 @@ fn two_peer_convergence_and_replay() {
     }
 }
 
-/// A rollback replaces the revoked speculation's queued audio instead of
-/// appending to it. The ring's unplayed backlog voices exactly the ticks
-/// the rewind revokes; leaving it while the re-sim mixes those ticks
-/// again would hand the host duplicate audio for every rollback — the
-/// audible netplay stutter.
+/// A rollback revokes EXACTLY the speculation's queued audio: the settled
+/// backlog beneath it survives (a full clear would skip it — the audible
+/// per-rollback crunch and the queue collapse behind the underruns that
+/// follow), and the re-sim replaces the revoked span instead of appending
+/// duplicates (the audible netplay stutter). With nothing consuming, the
+/// observable is that the ring level rides through the rollback, moving
+/// only by the advance's net new ticks.
 #[test]
-fn rollback_audio_replaces_instead_of_appending() {
+fn rollback_audio_exactly_replaces_revoked_span() {
     mgba::log::install_default_logger();
     let rom = testrom::build();
-    let mut peer =
-        Session::new(Link::new(vec![rom.clone(), rom]).unwrap(), 0, DELAY).unwrap();
+    let mut peer = Session::new(Link::new(vec![rom.clone(), rom]).unwrap(), 0, DELAY).unwrap();
     peer.with_link(|l| {
         for i in 0..l.num_players() {
             let core = l.core_mut(i);
@@ -211,8 +212,6 @@ fn rollback_audio_replaces_instead_of_appending() {
         assert_eq!(rep.rolled_back, 0, "matching inputs must not roll back");
         peer.add_remote_input(1, 0, 0);
     }
-    let backlog = peer.with_link(|l| l.core_mut(0).audio_buffer().available());
-    assert!(backlog > 0, "the test rom must queue audio for this test to bite");
 
     // Speculate past the settled boundary, then land a contradiction
     // for the first speculated tick.
@@ -220,22 +219,136 @@ fn rollback_audio_replaces_instead_of_appending() {
     for _ in 0..HELD {
         peer.advance(0).unwrap();
     }
+    let spec = peer.with_link(|l| l.core_mut(0).audio_buffer().available());
+    assert!(spec > 0, "the test rom must queue audio for this test to bite");
     for _ in 0..HELD {
         peer.add_remote_input(1, 0x3, 0);
     }
     let (_, rep) = peer.advance(0).unwrap();
     assert!(rep.rolled_back > 0, "the contradiction must force a rollback");
 
+    // One tick of source audio, upper-bounded (32768 Hz / ~59.7 fps).
+    const TICK: usize = 560;
     let after = peer.with_link(|l| l.core_mut(0).audio_buffer().available());
-    // The re-simulated ticks refill the ring...
-    assert!(after > 0, "the re-sim must emit fresh audio");
-    // ...but the revoked backlog is gone. Appending would leave the ring
-    // strictly deeper than it was before the rollback.
+    // A full clear leaves only the re-simmed ticks (collapse by ~30
+    // settled ticks); appending leaves the revoked span AND its re-sim
+    // (growth by rolled_back ticks). Exact replacement moves the level
+    // by only the advance's net new ticks.
     assert!(
-        after < backlog,
-        "rollback appended to the audio ring instead of replacing it: \
-         {after} queued sample frames vs {backlog} before the rollback"
+        after > spec.saturating_sub(TICK),
+        "rollback dropped settled backlog: {after} queued sample frames vs {spec} before"
     );
+    assert!(
+        after <= spec + 2 * TICK,
+        "rollback appended duplicates: {after} queued sample frames vs {spec} before \
+         (rolled back {})",
+        rep.rolled_back
+    );
+}
+
+/// The stream a consumer pulls off the local core across a full mesh
+/// run — rollbacks included — must be EXACTLY the stream a lone link
+/// running the same schedule produces: nothing skipped (a cleared
+/// settled backlog), nothing repeated (an appended duplicate span), no
+/// echo of spans consumed mid-speculation (naive replacement). The
+/// testrom's tone is input-independent, so even revoked spans
+/// regenerate bit-identically and whole-stream equality is exact.
+fn rollback_audio_stream_matches_straight_run(consume_per_frame: usize) {
+    mgba::log::install_default_logger();
+    let rom = testrom::build();
+
+    // Golden: a lone link on the confirmed schedule, fully drained.
+    let mut golden = Vec::new();
+    let mut tmp = Vec::new();
+    {
+        let mut link = Link::new(vec![rom.clone(); 2]).unwrap();
+        link.core_mut(0).audio_buffer().clear();
+        for t in 0..FRAMES {
+            link.tick(&[keys_for(0, t), keys_for(1, t)]);
+            let buf = link.core_mut(0).audio_buffer();
+            let n = buf.available();
+            tmp.resize(n * 2, 0);
+            buf.read(&mut tmp, n);
+            golden.extend_from_slice(&tmp[..n * 2]);
+        }
+    }
+
+    // The mesh, with an "audio callback" pulling off peer 0 each frame.
+    let mut peers = (0..2)
+        .map(|i| {
+            let mut link = Link::new(vec![rom.clone(); 2]).unwrap();
+            link.core_mut(i).set_audio_buffer_size(16384);
+            link.core_mut(i).audio_buffer().clear();
+            Session::new(link, i, DELAY).unwrap()
+        })
+        .collect::<Vec<_>>();
+    let mut wires: Vec<Vec<Wire>> = (0..2)
+        .map(|to| (0..2).filter(|&from| from != to).map(Wire::new).collect())
+        .collect();
+
+    let mut consumed = Vec::new();
+    let mut rollbacks = 0;
+    for frame in 0..FRAMES {
+        for i in 0..2 {
+            let (out, rep) = peers[i].advance(keys_for(i, frame)).unwrap();
+            if i == 0 {
+                rollbacks += rep.rolled_back;
+            }
+            wires[1 - i][0].send(frame, out);
+        }
+        for (to, peer) in peers.iter_mut().enumerate() {
+            for wire in &mut wires[to] {
+                wire.deliver(frame, peer);
+            }
+        }
+        peers[0].with_link(|l| {
+            let buf = l.core_mut(0).audio_buffer();
+            let n = buf.available().min(consume_per_frame);
+            tmp.resize(n * 2, 0);
+            buf.read(&mut tmp, n);
+            consumed.extend_from_slice(&tmp[..n * 2]);
+        });
+    }
+    assert!(rollbacks > 0, "latency > present delay must force rollbacks");
+
+    // Whatever is still queued is the stream's tail.
+    peers[0].with_link(|l| {
+        let buf = l.core_mut(0).audio_buffer();
+        let n = buf.available();
+        tmp.resize(n * 2, 0);
+        buf.read(&mut tmp, n);
+        consumed.extend_from_slice(&tmp[..n * 2]);
+    });
+
+    assert!(
+        consumed.len() > FRAMES as usize * 500 && consumed.len() <= golden.len(),
+        "expected a substantial prefix of the straight run, got {} of {} samples",
+        consumed.len(),
+        golden.len()
+    );
+    if let Some(at) = consumed.iter().zip(&golden).position(|(a, b)| a != b) {
+        panic!(
+            "consumed stream diverges from the straight run at interleaved sample {at}: \
+             {} vs {} ({rollbacks} rollbacks over {FRAMES} frames)",
+            consumed[at], golden[at]
+        );
+    }
+}
+
+#[test]
+fn rollback_audio_stream_starved_consumer() {
+    // Consumption ≥ production: the playhead rides the frontier, so
+    // rollbacks revoke audio that already played and the catch-up
+    // drain must swallow its regeneration (kept, it plays as an echo).
+    rollback_audio_stream_matches_straight_run(560);
+}
+
+#[test]
+fn rollback_audio_stream_buffered_consumer() {
+    // Consumption slightly under production: a settled backlog rides
+    // beneath the speculation, and every rollback must drop only its
+    // revoked span and leave the backlog intact.
+    rollback_audio_stream_matches_straight_run(500);
 }
 
 #[test]

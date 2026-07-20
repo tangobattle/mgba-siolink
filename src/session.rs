@@ -24,6 +24,24 @@ use std::sync::{Arc, Mutex};
 
 use crate::{Link, Snapshot, MAX_PLAYERS};
 
+/// Remove `frames` sample frames starting `start` frames from the OLDEST
+/// end of a core's mixed-output audio ring, closing the gap — the
+/// surgical complement of [`read`](mgba::audio::AudioBuffer::read),
+/// which can only consume from the oldest end: read everything out and
+/// write both remnants back.
+fn remove_span(buf: &mut mgba::audio::AudioBuffer, scratch: &mut Vec<i16>, start: usize, frames: usize) {
+    let avail = buf.available();
+    let frames = frames.min(avail.saturating_sub(start));
+    if frames == 0 {
+        return;
+    }
+    let channels = buf.channels() as usize;
+    scratch.resize(avail * channels, 0);
+    buf.read(scratch, avail);
+    buf.write(scratch, start);
+    buf.write(&scratch[(start + frames) * channels..], avail - start - frames);
+}
+
 /// An input packet to forward to every peer: the local player's keys for
 /// local tick `tick`, plus this side's tick advantage for clock sync.
 ///
@@ -103,6 +121,22 @@ struct Shared {
     /// [`Session::advance`] last reset it — the livelock early-warning
     /// ([`Report::slices_peak`]).
     slices_peak: usize,
+    /// Per-core cumulative sample frames appended to the mixed-output
+    /// audio ring AND kept (net of revocation drops and re-sim drains) —
+    /// the coordinate system rollback revocation math runs in. Only
+    /// meaningful for rings a consumer drains: an undrained ring pegs at
+    /// capacity, its appends stop landing, and its counter stalls with
+    /// them (harmless — nobody is listening to it).
+    audio_produced: [u64; MAX_PLAYERS],
+    /// Sample frames of re-simulated audio still to swallow during the
+    /// current rollback catch-up, per core: the corrected regeneration
+    /// of spans whose speculative version already played. It cannot be
+    /// unplayed, so queuing the regeneration would replay audio the
+    /// listener already heard — an echo. Swallowed oldest-first out of
+    /// each catch-up tick's fresh production instead.
+    audio_resim_drain: [u64; MAX_PLAYERS],
+    /// Scratch for [`remove_span`].
+    audio_scratch: Vec<i16>,
 }
 
 /// A cloneable, cross-thread handle to the live link — the readout seam
@@ -127,6 +161,10 @@ impl LinkHandle {
 struct SnapshotAt {
     snap: Snapshot,
     tick: u32,
+    /// [`Shared::audio_produced`] at save time, so a rollback to this
+    /// snapshot knows exactly how many ring frames its speculation
+    /// appended — the amount `load` must revoke.
+    audio_produced: [u64; MAX_PLAYERS],
 }
 
 /// The [`getgud::World`] over a [`Link`]: `step` is one lockstep tick,
@@ -162,7 +200,29 @@ impl getgud::World for LinkWorld {
         let keys = self.key_row(*local, remotes);
         let mut guard = self.shared.lock().unwrap();
         let shared = &mut *guard;
+        let mut before = [0u64; MAX_PLAYERS];
+        for i in 0..self.num_players {
+            before[i] = shared.link.core_mut(i).audio_buffer().available() as u64;
+        }
         let slices = shared.link.try_tick(&keys[..self.num_players])?;
+        for i in 0..self.num_players {
+            // Nothing consumes between the two reads (the host's audio
+            // callback takes this same mutex), so the delta is exactly
+            // this tick's kept production.
+            let buf = shared.link.core_mut(i).audio_buffer();
+            let mut delta = (buf.available() as u64).saturating_sub(before[i]);
+            if shared.audio_resim_drain[i] > 0 && delta > 0 {
+                // Catch-up regeneration of already-played audio: swallow
+                // it oldest-first out of this tick's fresh span, so the
+                // seam lands exactly where playback left off.
+                let drain = shared.audio_resim_drain[i].min(delta) as usize;
+                let avail = buf.available();
+                remove_span(buf, &mut shared.audio_scratch, avail - delta as usize, drain);
+                shared.audio_resim_drain[i] -= drain as u64;
+                delta -= drain as u64;
+            }
+            shared.audio_produced[i] += delta;
+        }
         shared.slices_peak = shared.slices_peak.max(slices);
         shared.live_tick += 1;
         if let Some(observer) = shared.observer.as_mut() {
@@ -174,9 +234,11 @@ impl getgud::World for LinkWorld {
     fn save(&mut self) -> Result<SnapshotAt, mgba::Error> {
         let mut shared = self.shared.lock().unwrap();
         let tick = shared.live_tick;
+        let audio_produced = shared.audio_produced;
         Ok(SnapshotAt {
             snap: shared.link.save()?,
             tick,
+            audio_produced,
         })
     }
 
@@ -192,15 +254,32 @@ impl getgud::World for LinkWorld {
         }
         shared.link.load(&state.snap)?;
         // The mixed-output audio rings are playback state, not machine
-        // state: whatever is queued past this point voices the very
-        // speculation being revoked, and the re-simulation is about to
-        // mix those same ticks again. Left in place, the duplicates
-        // play as a repeat and ratchet the host's queue toward its
-        // backlog discard — the audible rollback stutter. Clear them so
-        // the re-sim replaces the revoked audio instead of appending
-        // to it.
+        // state: rewind them by exactly the revoked span. Everything
+        // appended since the snapshot voices the speculation being
+        // revoked. The part still queued is dropped from the write end —
+        // the settled backlog beneath it is final audio a full clear
+        // would skip over (the audible per-rollback crunch, and the
+        // queue-level collapse behind the underruns that follow). The
+        // part the host already played cannot be unplayed, so its
+        // corrected regeneration is swallowed during the catch-up
+        // instead of queuing as an echo. By determinism the catch-up
+        // regenerates the revoked span sample-for-sample (barring an
+        // input-driven SOUNDBIAS rate change inside the window — rare,
+        // and off by at most that window), so playback resumes exactly
+        // where it left off.
         for i in 0..shared.link.num_players() {
-            shared.link.core_mut(i).audio_buffer().clear();
+            let revoked = shared.audio_produced[i] - state.audio_produced[i];
+            let buf = shared.link.core_mut(i).audio_buffer();
+            let queued = buf.available() as u64;
+            let dropped = revoked.min(queued);
+            remove_span(
+                buf,
+                &mut shared.audio_scratch,
+                (queued - dropped) as usize,
+                dropped as usize,
+            );
+            shared.audio_resim_drain[i] = revoked - dropped;
+            shared.audio_produced[i] = state.audio_produced[i];
         }
         shared.live_tick = state.tick;
         if let Some(observer) = shared.observer.as_mut() {
@@ -261,6 +340,7 @@ impl Session {
         let initial = SnapshotAt {
             snap: link.save()?,
             tick: 0,
+            audio_produced: [0; MAX_PLAYERS],
         };
         let shared = Arc::new(Mutex::new(Shared {
             link,
@@ -268,6 +348,9 @@ impl Session {
             confirmed: Vec::new(),
             observer: None,
             slices_peak: 0,
+            audio_produced: [0; MAX_PLAYERS],
+            audio_resim_drain: [0; MAX_PLAYERS],
+            audio_scratch: Vec::new(),
         }));
         Ok(Session {
             inner: getgud::Session::new(getgud::SessionParams {

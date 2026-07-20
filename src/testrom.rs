@@ -172,6 +172,29 @@ pub fn build() -> Vec<u8> {
     }
 
     asm.emit(mov_imm(0, 4, 0x04)); // r0 = 0x04000000
+
+    // PSG channel 1: a steady square tone, so the mixed output rings
+    // carry deterministic, input-independent, NONZERO content — the
+    // rollback-audio tests compare consumed sample streams bit for bit,
+    // which silence can't distinguish. Master enable must come first
+    // (PSG registers ignore writes while SOUNDCNT_X bit 7 is clear);
+    // freq 0x403 keeps the tone period a non-integer number of output
+    // samples so stream misalignments can't alias away.
+    asm.emit(mov_imm(1, 0, 0x80));
+    asm.emit(strh(1, 0, 0x84)); // SOUNDCNT_X: master on
+    asm.emit(mov_imm(1, 0, 0x77));
+    asm.emit(orr_imm(AL, 1, 1, 12, 0xFF));
+    asm.emit(strh(1, 0, 0x80)); // SOUNDCNT_L: vol 7/7, ch1-4 to L+R
+    asm.emit(mov_imm(1, 0, 0x02));
+    asm.emit(strh(1, 0, 0x82)); // SOUNDCNT_H: PSG at 100%
+    asm.emit(mov_imm(1, 0, 0));
+    asm.emit(strh(1, 0, 0x60)); // SOUND1CNT_L: no sweep
+    asm.emit(mov_imm(1, 12, 0xF0));
+    asm.emit(strh(1, 0, 0x62)); // SOUND1CNT_H: envelope 15, constant
+    asm.emit(mov_imm(1, 12, 0x84));
+    asm.emit(orr_imm(AL, 1, 1, 0, 0x03));
+    asm.emit(strh(1, 0, 0x64)); // SOUND1CNT_X: restart, freq 0x403
+
     asm.emit(orr_imm(AL, 0, 0, 14, 0x12)); // r0 |= 0x120
     asm.emit(mov_imm(1, 0, 0));
     asm.emit(strh(1, 0, RCNT)); // RCNT = 0
