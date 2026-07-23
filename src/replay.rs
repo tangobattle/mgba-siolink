@@ -17,7 +17,7 @@
 //!   bit 7 (op): 0 = "default value is zero", 1 = "default value is the previous tick"
 //!   bit 6:      p0 takes the default (no p0 low byte follows)
 //!   bit 5:      p1 takes the default (no p1 low byte follows)
-//!   bit 4:      MARK flag (overlay; resets the running "previous" to `[0, 0]`)
+//!   bit 4:      MARK flag (overlay annotation; no effect on decoding)
 //!   bits 0..=1: high 2 bits of an explicit p0
 //!   bits 2..=3: high 2 bits of an explicit p1
 //!
@@ -51,7 +51,6 @@ pub struct Writer<W: std::io::Write> {
     /// clears this.
     next_is_marked: bool,
     /// Last `[p0, p1]` emitted, for the "default = previous" tag form.
-    /// Reset to zero on every mark.
     prev: [u16; 2],
 }
 
@@ -71,7 +70,6 @@ impl<W: std::io::Write> Writer<W> {
     /// boundary) simply never reaches the stream.
     pub fn mark(&mut self) {
         self.next_is_marked = true;
-        self.prev = [0, 0];
     }
 
     /// Append one confirmed tick's input pair. GBA joypads are 10 bits.
@@ -195,7 +193,6 @@ impl Stream {
 
             if tag & MARK != 0 {
                 marks.push(inputs.len());
-                prev = [0, 0];
             }
 
             let Some(p0) = side(&mut r, tag, 0, P0_DEFAULT, prev[0])? else {
@@ -255,8 +252,8 @@ mod tests {
     #[test]
     fn roundtrips_marks() {
         // Marks on the first tick, mid-stream, and across a held run —
-        // the held value straddling a mark exercises the prev reset on
-        // both sides of the codec.
+        // the held value straddling a mark leans on the previous-tick
+        // default across the boundary.
         roundtrip(&[
             (true, [0x041, 0x082]),
             (false, [0x041, 0x082]),
@@ -267,15 +264,17 @@ mod tests {
     }
 
     #[test]
-    fn mark_resets_the_previous_tick_default() {
-        // Without the reset, the marked tick would encode "same as
-        // previous" as a bare op=1 tag and a stale decoder would echo
-        // the pre-mark value.
+    fn marked_tick_keeps_the_previous_tick_default() {
+        // A mark annotates its tick, it doesn't touch the codec: a held
+        // pair straddling a mark still costs one tag byte.
         let mut w = Writer::new(Vec::new());
         w.push([0x155, 0x2aa]).unwrap();
         w.mark();
         w.push([0x155, 0x2aa]).unwrap();
         let bytes = w.finish().unwrap();
+        // Explicit first tick (tag + 2 low bytes), 1-byte marked tick,
+        // sentinel.
+        assert_eq!(bytes.len(), 3 + 1 + 1);
         let s = Stream::read(&bytes[..]).unwrap();
         assert_eq!(s.inputs, vec![[0x155, 0x2aa], [0x155, 0x2aa]]);
         assert_eq!(s.marks, vec![1]);
