@@ -2,13 +2,13 @@
 //! own copy of the link, exchanging input packets over a full mesh of
 //! wires with more latency than the present delay covers, forcing real
 //! mispredictions and rollbacks. The peers must stay bit-identical on
-//! every commonly-settled tick — and for the two-player case, the recorded
-//! replay must re-simulate to the same digests.
+//! every commonly-settled tick — and the confirmed stream, re-simulated
+//! linearly on a fresh link, must land on the same digests.
 
 use std::collections::{HashMap, VecDeque};
 
 use mgba_rollback::session::{Outgoing, Session};
-use mgba_rollback::{replay, testrom, Link};
+use mgba_rollback::{testrom, Link};
 
 /// Present delay — purely local now, but kept equal on all peers so the
 /// simulation is symmetric.
@@ -144,38 +144,32 @@ fn run_mesh(num_players: usize) -> MeshRun {
 }
 
 #[test]
-fn two_peer_convergence_and_replay() {
+fn two_peer_convergence_and_linear_resim() {
     let run = run_mesh(2);
 
-    // Record peer 0's confirmed stream through the (two-sided) replay
-    // stream encoding; ticks must come out 1-based and gapless, like
+    // Peer 0's confirmed rows must come out 1-based and gapless, like
     // on_tick's.
-    let mut recorder = replay::Writer::new(Vec::new());
-    let mut recorded = 0u32;
-    for (tick, keys) in &run.confirmed {
-        recorded += 1;
-        assert_eq!(*tick, recorded, "confirmed ticks are 1-based like on_tick's");
-        recorder.push([keys[0] as u16, keys[1] as u16]).unwrap();
+    for (i, (tick, _)) in run.confirmed.iter().enumerate() {
+        assert_eq!(*tick, i as u32 + 1, "confirmed ticks are 1-based like on_tick's");
     }
 
-    // The replay must land on the same states the live sessions agreed on.
+    // The confirmed stream must land on the same states the live
+    // sessions agreed on — it's what a replay sink records, and a
+    // recording is only as good as this stream.
     let rom = testrom::build();
-    let parsed = replay::Stream::read(&recorder.finish().unwrap()[..]).unwrap();
-    assert!(parsed.is_complete);
-    assert_eq!(parsed.inputs.len(), recorded as usize);
     let mut link = Link::new(vec![rom.clone(), rom]).unwrap();
-    for (tick, [p0, p1]) in parsed.inputs.iter().copied().enumerate() {
+    for (tick, (_, keys)) in run.confirmed.iter().enumerate() {
         if let Some((digest, seen)) = run.checkpoints.get(&(tick as u32)) {
             if seen.iter().all(|&s| s) {
                 let snap = link.save().unwrap();
                 assert_eq!(
                     snap.digest(),
                     *digest,
-                    "replay diverged from the live sessions at tick {tick}"
+                    "linear re-sim diverged from the live sessions at tick {tick}"
                 );
             }
         }
-        link.tick(&[p0 as u32, p1 as u32]);
+        link.tick(keys);
     }
 }
 

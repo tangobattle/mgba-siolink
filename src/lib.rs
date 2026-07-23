@@ -38,7 +38,6 @@
 //! that partial progress is exactly captured by the link snapshot, so the
 //! interleave replays identically after a restore.
 
-pub mod replay;
 pub mod session;
 pub mod testrom;
 pub mod throttler;

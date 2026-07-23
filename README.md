@@ -20,11 +20,6 @@ peer, feeds confirmed local + predicted remote keys into `tick`, and restores a
 - `throttler` — tango's time-sync throttler (verbatim copy): feeds on the
   session's skew and speculation balance, the leading peer sheds fps until
   the clocks realign
-- `replay` — the per-tick two-sided input-stream encoding for replays, with
-  "marks" to demarcate spans of ticks (tango's rounds). Just the stream: the
-  file framing around it (header, boot state, metadata) is the embedder's —
-  tango's replay container writes its own and delegates the input records
-  here
 - `testrom` — built-in SIO ping-pong ROM that runs at any player count, so
   tests need no game ROMs
 
