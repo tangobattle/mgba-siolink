@@ -148,28 +148,23 @@ fn two_peer_convergence_and_replay() {
     let run = run_mesh(2);
 
     // Record peer 0's confirmed stream through the (two-sided) replay
-    // container; ticks must come out 1-based and gapless, like on_tick's.
-    let mut recorder = replay::Writer::new(
-        Vec::new(),
-        &replay::Metadata {
-            rtc_unix_micros: None,
-            sides: Default::default(),
-        },
-    )
-    .unwrap();
+    // stream encoding; ticks must come out 1-based and gapless, like
+    // on_tick's.
+    let mut recorder = replay::Writer::new(Vec::new());
     let mut recorded = 0u32;
     for (tick, keys) in &run.confirmed {
         recorded += 1;
         assert_eq!(*tick, recorded, "confirmed ticks are 1-based like on_tick's");
-        recorder.push([keys[0], keys[1]]).unwrap();
+        recorder.push([keys[0] as u16, keys[1] as u16]).unwrap();
     }
 
     // The replay must land on the same states the live sessions agreed on.
     let rom = testrom::build();
-    let parsed = replay::Replay::parse(&recorder.finish().unwrap()).unwrap();
+    let parsed = replay::Stream::read(&recorder.finish().unwrap()[..]).unwrap();
+    assert!(parsed.is_complete);
     assert_eq!(parsed.inputs.len(), recorded as usize);
     let mut link = Link::new(vec![rom.clone(), rom]).unwrap();
-    for (tick, keys) in parsed.inputs.iter().enumerate() {
+    for (tick, [p0, p1]) in parsed.inputs.iter().copied().enumerate() {
         if let Some((digest, seen)) = run.checkpoints.get(&(tick as u32)) {
             if seen.iter().all(|&s| s) {
                 let snap = link.save().unwrap();
@@ -180,7 +175,7 @@ fn two_peer_convergence_and_replay() {
                 );
             }
         }
-        link.tick(keys);
+        link.tick(&[p0 as u32, p1 as u32]);
     }
 }
 
