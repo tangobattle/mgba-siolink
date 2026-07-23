@@ -7,7 +7,7 @@
 //! frequency readback clobber, the stale square output latches, and the
 //! absolute sampling-grid anchor in the mgba fork's deserialize path.
 
-use mgba_siolink::{testrom, Link};
+use mgba_rollback::{testrom, Link};
 
 fn drain(link: &mut Link, out: &mut Vec<i16>) {
     let buf = link.core_mut(0).audio_buffer();

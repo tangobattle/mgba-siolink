@@ -1,4 +1,4 @@
-# mgba-siolink
+# mgba-rollback
 
 Experimental generic rollback netplay over emulated SIO (link cable), built on
 [mgba-rs](https://github.com/tangobattle/mgba-rs).

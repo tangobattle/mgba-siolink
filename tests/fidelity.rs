@@ -7,7 +7,7 @@
 //! mgba's stale SIOCNT/RCNT shadows and unserialized SIOMLT_SEND (now
 //! repaired in `mgba::sio::Driver::load_state`).
 
-use mgba_siolink::{testrom, Link};
+use mgba_rollback::{testrom, Link};
 
 fn schedule(t: u32, num_players: usize) -> Vec<u32> {
     (0..num_players as u32)

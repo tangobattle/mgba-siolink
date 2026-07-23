@@ -10,7 +10,7 @@
 //!   !state TAG              save a Link snapshot to <outdir>/TAG.snap? (no)
 //! and prints cut-in telemetry at every script step boundary.
 
-use mgba_siolink::{Link, LinkOptions, Peripheral, SideOptions};
+use mgba_rollback::{Link, LinkOptions, Peripheral, SideOptions};
 
 const BATTLECTL: u32 = 0x02006ca0;
 const CUTSCENE: u32 = 0x0200a810;

@@ -7,7 +7,7 @@
 //! fixed script, so the whole run stays deterministic and the rollback
 //! test can replay it after a restore.
 
-use mgba_siolink::{testrom, BootSide, Link, LinkOptions, Peripheral, SideOptions};
+use mgba_rollback::{testrom, BootSide, Link, LinkOptions, Peripheral, SideOptions};
 
 const IDLE: u32 = 0x8000_0000;
 
@@ -1070,7 +1070,7 @@ fn a_late_joiner_fills_the_departed_seat() {
     tick(&mut d);
     let side_d = capture(&mut d, 0);
     assert_eq!(
-        mgba_siolink::Link::from_states(vec![capture(&mut d, 0)], None, Peripheral::Wireless)
+        mgba_rollback::Link::from_states(vec![capture(&mut d, 0)], None, Peripheral::Wireless)
             .unwrap()
             .player_id(0),
         0,

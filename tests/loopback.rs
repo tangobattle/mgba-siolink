@@ -4,7 +4,7 @@
 //! reproduces the exact same trajectory — including snapshots taken with a
 //! transfer in flight or a core parked by the lockstep protocol.
 
-use mgba_siolink::{testrom, Link};
+use mgba_rollback::{testrom, Link};
 
 /// Digest of the link's rollback-relevant state. Deliberately built from
 /// discrete savestate fields rather than the raw state bytes: mgba

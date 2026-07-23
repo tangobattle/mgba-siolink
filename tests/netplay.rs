@@ -7,8 +7,8 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use mgba_siolink::session::{Outgoing, Session};
-use mgba_siolink::{replay, testrom, Link};
+use mgba_rollback::session::{Outgoing, Session};
+use mgba_rollback::{replay, testrom, Link};
 
 /// Present delay — purely local now, but kept equal on all peers so the
 /// simulation is symmetric.

@@ -3,7 +3,7 @@
 //! bit-identical across peers, rollback works on the plugged-in link, and
 //! a side extracted from the link continues alone (the cable unplugs).
 
-use mgba_siolink::{testrom, BootSide, Link, Peripheral};
+use mgba_rollback::{testrom, BootSide, Link, Peripheral};
 
 fn read_log(link: &mut Link, core: usize, halfwords: usize) -> Vec<u16> {
     let mut buf = vec![0u8; halfwords * 2];

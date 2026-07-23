@@ -4,7 +4,7 @@
 //! assert the cap keeps a wide margin above it. If a legitimate workload
 //! ever approaches the cap, this fails before any user's session does.
 
-use mgba_siolink::{testrom, Link, MAX_SLICES_PER_TICK};
+use mgba_rollback::{testrom, Link, MAX_SLICES_PER_TICK};
 
 #[test]
 fn real_ticks_fit_far_under_the_slice_cap() {

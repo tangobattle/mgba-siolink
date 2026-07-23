@@ -367,7 +367,7 @@ impl Link {
         let core_options = mgba::core::Options::default();
 
         let mut cores = (0..num_players)
-            .map(|_| mgba::core::OwnedCore::new_gba("mgba-siolink", &core_options))
+            .map(|_| mgba::core::OwnedCore::new_gba("mgba-rollback", &core_options))
             .collect::<Result<Vec<_>, _>>()?;
 
         for (i, (core, side)) in cores.iter_mut().zip(options.sides).enumerate() {
@@ -425,7 +425,7 @@ impl Link {
         let core_options = mgba::core::Options::default();
 
         let mut cores = (0..num_players)
-            .map(|_| mgba::core::OwnedCore::new_gba("mgba-siolink", &core_options))
+            .map(|_| mgba::core::OwnedCore::new_gba("mgba-rollback", &core_options))
             .collect::<Result<Vec<_>, _>>()?;
         let mut adapters = Vec::with_capacity(num_players);
         for (core, side) in cores.iter_mut().zip(sides) {

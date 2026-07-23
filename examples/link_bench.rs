@@ -16,7 +16,7 @@
 //! (default 2) sizes the link. Note real games only link up in their own
 //! 2-player modes; 3-4 player links are exercised by the test ROM.
 
-use mgba_siolink::{testrom, Link, LinkOptions, SideOptions};
+use mgba_rollback::{testrom, Link, LinkOptions, SideOptions};
 
 const WARMUP: u32 = 120;
 const TICKS: u32 = 600;
@@ -147,7 +147,7 @@ fn main() {
         },
     );
 
-    let mut ring: std::collections::VecDeque<mgba_siolink::Snapshot> = std::collections::VecDeque::new();
+    let mut ring: std::collections::VecDeque<mgba_rollback::Snapshot> = std::collections::VecDeque::new();
     bench(
         "+rollback",
         num_players,
